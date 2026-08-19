@@ -3,7 +3,6 @@ package egress
 import (
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -14,6 +13,8 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/config"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/mimic"
+	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/muxcfg"
+	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/pipe"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/securestream"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/sysutil"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/tlscert"
@@ -294,25 +295,26 @@ func handleIncomingConnection(conn net.Conn, m mimic.ServerMimic, label string) 
 		if errors.Is(err, securestream.ErrAuth) {
 			slog.Debug("unauthorized/replayed probe; routing to decoy", "client_ip", clientIP, "mimic", label)
 		}
-		go m.ProxyDecoy(replayConn)
+		if replayConn != nil {
+			go m.ProxyDecoy(replayConn)
+		} else {
+			_ = conn.Close()
+		}
 		return
 	}
 
-	// 2. Elevate the authenticated, decrypted connection to a Yamux server.
-	yamuxCfg := yamux.DefaultConfig()
-	yamuxCfg.EnableKeepAlive = false // Hub handles custom randomized keep-alives
-	yamuxCfg.MaxStreamWindowSize = 4 * 1024 * 1024
-	yamuxCfg.StreamCloseTimeout = 3 * time.Minute
-
+	// 2. Elevate the authenticated, decrypted connection to a Yamux server using
+	// exactly the same high-RTT flow-control profile as the hub.
+	yamuxCfg := muxcfg.WAN()
 	session, err := yamux.Server(secureConn, yamuxCfg)
 	if err != nil {
-		secureConn.Close()
+		_ = secureConn.Close()
 		return
 	}
 
 	slog.Info("authentic hub connection established", "client_ip", clientIP, "mimic", label)
 
-	// 3. Accept logical streams from the Hub and route them to the open internet
+	// 3. Accept logical streams from the Hub and route them to the open internet.
 	go handleYamuxSession(session)
 }
 
@@ -321,8 +323,7 @@ func handleYamuxSession(session *yamux.Session) {
 	for {
 		stream, err := session.AcceptStream()
 		if err != nil {
-			// Physical connection died or closed
-			session.Close()
+			_ = session.Close()
 			return
 		}
 
@@ -369,18 +370,9 @@ func handleTCPStream(stream net.Conn) {
 	}
 	defer remoteConn.Close()
 
-	// 4. Pipe traffic bidirectionally
-	errChan := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(remoteConn, stream)
-		errChan <- err
-	}()
-	go func() {
-		_, err := io.Copy(stream, remoteConn)
-		errChan <- err
-	}()
-
-	<-errChan
+	// Full-duplex copy with FIN/half-close propagation. Waiting for both directions
+	// prevents request EOF from truncating a response that is still in flight.
+	_ = pipe.Bidirectional(stream, remoteConn)
 }
 
 // errBlockedTarget marks a target rejected for pointing at a non-global address
@@ -472,7 +464,7 @@ func safeDialTarget(target string) (net.Conn, error) {
 	if isV4 {
 		network = "tcp4"
 	}
-	d := net.Dialer{Timeout: dialTimeout, LocalAddr: bindAddrTCP(isV4)}
+	d := net.Dialer{Timeout: dialTimeout, KeepAlive: 30 * time.Second, LocalAddr: bindAddrTCP(isV4)}
 	return d.Dial(network, net.JoinHostPort(ip.String(), port))
 }
 

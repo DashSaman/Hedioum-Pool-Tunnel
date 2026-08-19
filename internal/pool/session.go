@@ -147,12 +147,13 @@ func (ys *YamuxSession) GetAndResetBytes() uint64 {
 
 // UpdateChaosLimit shifts the per-pipe scale-out target randomly. Unlike upstream,
 // it does not install a hard rate limiter; this preserves the distribution signal
-// used by the pool without artificially capping a user's flow.
+// used by the pool without artificially capping a user's flow. Negative jitter is
+// treated as disabled so a malformed legacy/manual config can never panic rand.Intn.
 func (ys *YamuxSession) UpdateChaosLimit() {
 	ys.mu.Lock()
 	defer ys.mu.Unlock()
 
-	if ys.jitterMbps == 0 {
+	if ys.jitterMbps <= 0 {
 		ys.currentCapMbps = ys.baseLimitMbps
 	} else {
 		variance := rand.Intn((ys.jitterMbps*2)+1) - ys.jitterMbps

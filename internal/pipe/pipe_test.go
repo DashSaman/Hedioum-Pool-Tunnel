@@ -29,34 +29,84 @@ func TestHalfCloseUsesCloseWriteWhenAvailable(t *testing.T) {
 	}
 }
 
-func TestBidirectionalWaitsForBothDirections(t *testing.T) {
-	client, left := net.Pipe()
-	right, server := net.Pipe()
+func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
+	t.Helper()
+	ln, err := net.ListenTCP("tcp4", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan *net.TCPConn, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		c, err := ln.AcceptTCP()
+		if err != nil {
+			errCh <- err
+			return
+		}
+		accepted <- c
+	}()
+
+	dialed, err := net.DialTCP("tcp4", nil, ln.Addr().(*net.TCPAddr))
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	select {
+	case peer := <-accepted:
+		return dialed, peer
+	case err := <-errCh:
+		dialed.Close()
+		t.Fatalf("accept: %v", err)
+	case <-time.After(2 * time.Second):
+		dialed.Close()
+		t.Fatal("accept timeout")
+	}
+	return nil, nil
+}
+
+func TestBidirectionalPreservesResponseAfterRequestFIN(t *testing.T) {
+	client, left := tcpPair(t)
+	right, server := tcpPair(t)
 	defer client.Close()
+	defer left.Close()
+	defer right.Close()
 	defer server.Close()
 
 	done := make(chan error, 1)
 	go func() { done <- Bidirectional(left, right) }()
 
-	// Request reaches server.
-	go func() {
-		_, _ = client.Write([]byte("request"))
-		_ = client.Close()
-	}()
-	buf := make([]byte, len("request"))
-	if _, err := io.ReadFull(server, buf); err != nil {
-		t.Fatalf("server read: %v", err)
+	if _, err := client.Write([]byte("request")); err != nil {
+		t.Fatalf("client write: %v", err)
 	}
-	if string(buf) != "request" {
-		t.Fatalf("server got %q", buf)
+	if err := client.CloseWrite(); err != nil {
+		t.Fatalf("client CloseWrite: %v", err)
 	}
 
-	// Even though the request direction hit EOF, the response direction must stay
-	// alive long enough for the server to send the response.
-	if _, err := server.Write([]byte("response")); err != nil {
-		t.Fatalf("server write after request EOF: %v", err)
+	request, err := io.ReadAll(server)
+	if err != nil {
+		t.Fatalf("server read: %v", err)
 	}
-	_ = server.Close()
+	if string(request) != "request" {
+		t.Fatalf("server got %q", request)
+	}
+
+	// The request direction has reached EOF. The reverse direction must still be
+	// alive so the server can send a complete response.
+	if _, err := server.Write([]byte("response")); err != nil {
+		t.Fatalf("server write after request FIN: %v", err)
+	}
+	if err := server.CloseWrite(); err != nil {
+		t.Fatalf("server CloseWrite: %v", err)
+	}
+
+	response, err := io.ReadAll(client)
+	if err != nil {
+		t.Fatalf("client read response: %v", err)
+	}
+	if string(response) != "response" {
+		t.Fatalf("client got %q", response)
+	}
 
 	select {
 	case err := <-done:

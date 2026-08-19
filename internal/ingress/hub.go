@@ -15,23 +15,16 @@ import (
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/tunproto"
 )
 
-// StartIranHub initializes the SOCKS5 listeners and dynamically scaling connection
-// pools for all configured foreign egress nodes.
 func StartIranHub(cfg *config.AppConfig) {
 	hubManager := pool.NewHubManager()
 
 	for _, node := range cfg.ForeignNodes {
-		nodeCopy := node // local copy for the closure
-
-		// The dialer spreads new physical pipes across this node's endpoints with a
-		// fluctuating per-server mimic distribution (see dial.go).
+		nodeCopy := node
 		dialer := newEndpointDialer(nodeCopy)
 		hubManager.RegisterNode(nodeCopy, dialer.dial)
-
 		go startLocalSocksListener(nodeCopy, hubManager)
 	}
 
-	// Bring up an OS-level TUN interface for every node that opted in.
 	tunInstances := startTunInterfaces(cfg.ForeignNodes)
 
 	if len(cfg.ForeignNodes) == 0 {
@@ -39,18 +32,12 @@ func StartIranHub(cfg *config.AppConfig) {
 	}
 
 	sysutil.WaitForTerminationSignal()
-
-	// Stop the pool watchdogs/dials first so shutdown cannot create fresh sockets
-	// while TUN interfaces are being removed.
 	hubManager.Close()
 	for _, inst := range tunInstances {
 		_ = inst.Close()
 	}
 }
 
-// startTunInterfaces opens a TUN interface for each TUN-enabled node and returns
-// the running instances (to close on shutdown). Nodes without TUN are skipped;
-// a per-node failure is logged and does not stop the others or the SOCKS path.
 func startTunInterfaces(nodes []config.ForeignNode) []*tundev.Instance {
 	var instances []*tundev.Instance
 	for _, node := range nodes {
@@ -83,10 +70,6 @@ func startTunInterfaces(nodes []config.ForeignNode) []*tundev.Instance {
 	return instances
 }
 
-// startLocalSocksListener boots up a TCP server for the node's SOCKS5 port. It
-// binds to node.SocksBind (default 127.0.0.1, private to the host, for X-UI/Xray
-// colocated on the box); set to the container veth IP / 0.0.0.0 so LAN/router
-// clients can reach it when the hub runs in a container.
 func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManager) {
 	bind := node.SocksBind
 	if bind == "" {
@@ -112,8 +95,6 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
-			// Accept can fail repeatedly under FD/memory pressure. A small backoff
-			// prevents a resource-exhaustion condition from turning into a 100% CPU spin.
 			slog.Warn("SOCKS5 accept failed; retrying", "node", node.Alias, "err", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -122,8 +103,6 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 	}
 }
 
-// handleClientTraffic processes the local SOCKS5 handshake, extracts the target metadata,
-// and multiplexes the payload over a Yamux stream.
 func handleClientTraffic(localConn net.Conn, nodeAlias string, hubManager *pool.HubManager) {
 	defer localConn.Close()
 
@@ -132,6 +111,11 @@ func handleClientTraffic(localConn net.Conn, nodeAlias string, hubManager *pool.
 		slog.Debug("socks handshake failed", "node", nodeAlias, "err", err)
 		return
 	}
+	// The 3-second deadline belongs ONLY to parsing the local SOCKS greeting/request.
+	// Pool recovery/OpenStream may legitimately take longer on a lossy WAN. Leaving
+	// this deadline armed caused a later, successful tunnel acquisition to be thrown
+	// away because the final SOCKS reply hit the already-expired local deadline.
+	_ = localConn.SetDeadline(time.Time{})
 
 	switch cmd {
 	case cmdConnect:
@@ -144,7 +128,6 @@ func handleClientTraffic(localConn net.Conn, nodeAlias string, hubManager *pool.
 	}
 }
 
-// handleTCPConnect multiplexes a SOCKS5 CONNECT over a Yamux stream to the egress.
 func handleTCPConnect(localConn net.Conn, targetDest, nodeAlias string, hubManager *pool.HubManager) {
 	stream, err := hubManager.GetStreamTCP(nodeAlias)
 	if err != nil {
@@ -154,8 +137,6 @@ func handleTCPConnect(localConn net.Conn, targetDest, nodeAlias string, hubManag
 	}
 	defer stream.Close()
 
-	// Announce the stream before telling the SOCKS client that the tunnel path is
-	// ready. This avoids returning REP=success when the local pool itself is dead.
 	if err := tunproto.WriteTCPHeader(stream, targetDest); err != nil {
 		_ = sendSocksReply(localConn, repGeneralFailure, net.IPv4zero, 0)
 		return
@@ -163,9 +144,6 @@ func handleTCPConnect(localConn net.Conn, targetDest, nodeAlias string, hubManag
 	if err := sendSocksReply(localConn, repSuccess, net.IPv4zero, 0); err != nil {
 		return
 	}
-	_ = localConn.SetDeadline(time.Time{})
 
-	// Wait for both directions and propagate FIN independently. Returning after the
-	// first io.Copy used to truncate the still-active half of some connections.
 	_ = pipe.Bidirectional(localConn, stream)
 }

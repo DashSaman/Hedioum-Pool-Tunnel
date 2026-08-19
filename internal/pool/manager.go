@@ -15,12 +15,12 @@ import (
 )
 
 const (
-	defaultMaxConns   = 15
-	defaultMinConns   = 10
-	hardMaxConns      = 256
-	staggerDelay      = 500 * time.Millisecond
-	healthCheckFreq   = 10 * time.Second
-	maxTotalFactor    = 3
+	defaultMaxConns    = 15
+	defaultMinConns    = 10
+	hardMaxConns       = 256
+	staggerDelay       = 500 * time.Millisecond
+	healthCheckFreq    = 10 * time.Second
+	maxTotalFactor     = 3
 	recoveryBackoffMax = 10 * time.Second
 )
 
@@ -30,20 +30,20 @@ type DialFunc func() (*yamux.Session, string, error)
 type PoolStats struct{ ActiveConns, DrainingConns, TotalMbps int }
 
 type NodePool struct {
-	Alias                        string
-	label                        string
-	TargetIP                     string
+	Alias                          string
+	label                          string
+	TargetIP                       string
 	minConnections, maxConnections int
-	baseLimitMbps, jitterMbps    int
-	dialer                       DialFunc
-	lifecycle                    LifecyclePolicy
-	sessions                     []*YamuxSession
-	mu                           sync.RWMutex
-	currentMbps                  int32
-	replenishing                 int32
-	replenishWanted              int32
-	shutdown                     chan struct{}
-	stopOnce                     sync.Once
+	baseLimitMbps, jitterMbps      int
+	dialer                         DialFunc
+	lifecycle                      LifecyclePolicy
+	sessions                       []*YamuxSession
+	mu                             sync.RWMutex
+	currentMbps                    int32
+	replenishing                   int32
+	replenishWanted                int32
+	shutdown                       chan struct{}
+	stopOnce                       sync.Once
 }
 
 const (
@@ -65,9 +65,6 @@ func newNodePool(cfg config.ForeignNode, label string, minConns, maxConns int, d
 	return np
 }
 
-// normalizePoolBounds is a final defensive wall against hand-edited/corrupt
-// configs creating hundreds or thousands of physical pipes and exhausting FDs,
-// RAM or conntrack. Normal profiles are far below this ceiling (high-speed=40).
 func normalizePoolBounds(minConns, maxConns int) (int, int) {
 	if minConns < 1 {
 		minConns = defaultMinConns
@@ -125,10 +122,6 @@ func (hm *HubManager) GetStreamUDP(alias string) (net.Conn, error) {
 	return p.udp.getStreamLeastLoaded()
 }
 
-// reserveLeastLoaded serializes only the tiny selection/reservation operation; the
-// network-blocking OpenStream happens after the pool lock is released. Pending
-// reservations are part of LoadScore, so a burst of concurrent users is spread
-// across physical pipes instead of every goroutine observing the same stale winner.
 func (np *NodePool) reserveLeastLoaded() *YamuxSession {
 	np.mu.Lock()
 	defer np.mu.Unlock()
@@ -206,6 +199,9 @@ func (np *NodePool) monitorAndScale() {
 	}
 }
 
+// Pending stream reservations are treated as live users throughout lifecycle
+// decisions. This closes the race where a health tick could drain/evict a pipe
+// after selection but before Yamux had registered the new logical stream.
 func (np *NodePool) evaluateHealthAndScale() {
 	np.mu.Lock()
 	retained := make([]*YamuxSession, 0, len(np.sessions))
@@ -224,9 +220,10 @@ func (np *NodePool) evaluateHealthAndScale() {
 		total += mbps
 		s.UpdateChaosLimit()
 		cap := s.CurrentCap()
+		pending := s.PendingOpens()
 		if s.IsActive() {
 			retire := s.ShouldRetire()
-			if retire && draining < np.maxConnections && active > np.minConnections {
+			if retire && pending == 0 && draining < np.maxConnections && active > np.minConnections {
 				s.SetDraining()
 				active--
 				draining++
@@ -238,7 +235,7 @@ func (np *NodePool) evaluateHealthAndScale() {
 				if mbps >= int(float64(cap)*0.8) {
 					scale = true
 				}
-				if !retire && active > np.minConnections && draining < np.maxConnections && s.ActiveStreams() == 0 && s.IdleTime() > idleLimit {
+				if !retire && pending == 0 && active > np.minConnections && draining < np.maxConnections && s.ActiveStreams() == 0 && s.IdleTime() > idleLimit {
 					s.SetDraining()
 					active--
 					draining++
@@ -246,12 +243,12 @@ func (np *NodePool) evaluateHealthAndScale() {
 				}
 			}
 		} else if s.IsDraining() {
-			streams := s.ActiveStreams()
+			streamsAndPending := s.ActiveStreams() + pending
 			age := s.DrainingFor()
-			if shouldCloseDraining(streams, age, false) {
+			if shouldCloseDraining(streamsAndPending, age, false) {
 				_ = s.Close()
 				draining--
-				slog.Info("draining complete: connection closed", "node", np.Alias, "pool", np.label, "streams", streams, "drained_for", age.Round(time.Second))
+				slog.Info("draining complete: connection closed", "node", np.Alias, "pool", np.label, "streams", s.ActiveStreams(), "pending", pending, "drained_for", age.Round(time.Second))
 				continue
 			}
 		}
@@ -296,7 +293,7 @@ func (np *NodePool) evictOldestSafeDrainingLocked() bool {
 	idx := -1
 	var oldest time.Duration
 	for i, s := range np.sessions {
-		if !s.IsDraining() || s.ActiveStreams() > 0 {
+		if !s.IsDraining() || s.ActiveStreams() > 0 || s.PendingOpens() > 0 {
 			continue
 		}
 		if d := s.DrainingFor(); idx == -1 || d > oldest {
@@ -341,10 +338,6 @@ func atomicMaxInt32(dst *int32, v int32) {
 	}
 }
 
-// replenishWorker retries aggressively while it is making progress, but backs off
-// exponentially when every dial in a recovery batch fails. Without this, a route
-// outage that immediately returns ECONNREFUSED could spin thousands of TLS/SSH
-// handshakes and consume CPU/conntrack while users are already disconnected.
 func (np *NodePool) replenishWorker() {
 	failureStreak := 0
 	for {

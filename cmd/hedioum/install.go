@@ -17,12 +17,10 @@ import (
 //go:embed hedioum.service.tmpl
 var systemdUnit string
 
-// renderUnit fills the systemd unit template. tunCapable adds CAP_NET_ADMIN so
-// the hub can bring up an opt-in TUN interface; the foreign leaves it off.
 func renderUnit(tunCapable bool) string {
 	t, err := template.New("unit").Parse(systemdUnit)
 	if err != nil {
-		return systemdUnit // template is compiled-in; parse cannot realistically fail
+		return systemdUnit
 	}
 	var buf bytes.Buffer
 	if err := t.Execute(&buf, struct{ TunCapable bool }{tunCapable}); err != nil {
@@ -31,12 +29,9 @@ func renderUnit(tunCapable bool) string {
 	return buf.String()
 }
 
-// reconcileUnit rewrites the installed unit to match the node's role (the hub is
-// TUN-capable, the foreign is not) and reloads systemd. Best-effort: it is a no-op
-// when the service is not installed or we are not privileged.
 func reconcileUnit(role string) {
 	if _, err := os.Stat(installUnitPath); err != nil {
-		return // not installed under systemd (e.g. dev run)
+		return
 	}
 	if err := os.WriteFile(installUnitPath, []byte(renderUnit(role == "iran")), 0644); err != nil {
 		return
@@ -49,6 +44,21 @@ const (
 	installUnitPath = "/etc/systemd/system/hedioum.service"
 )
 
+// Conservative high-BDP tuning applied identically on Iran and foreign hosts.
+// These are CEILINGS, not preallocated buffers: TCP autotuning grows only busy
+// sockets as required. 32 MiB comfortably covers ~400 Mbps at ~500 ms BDP while
+// avoiding the extreme global memory settings seen in many "speed tweak" scripts.
+const networkSysctlConfig = `net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.ipv4.tcp_rmem=4096 262144 33554432
+net.ipv4.tcp_wmem=4096 262144 33554432
+net.core.netdev_max_backlog=16384
+net.core.somaxconn=4096
+net.ipv4.tcp_mtu_probing=1
+`
+
 // cmdInstall self-installs the running binary + the systemd unit, with no network
 // access required — deploy by copying the binary to the server and running this.
 func cmdInstall(args []string) {
@@ -56,8 +66,6 @@ func cmdInstall(args []string) {
 		fail("install must run as root")
 	}
 
-	// The config/working directory must exist before the (namespaced) service can
-	// start — the hardened unit sets WorkingDirectory + ReadWritePaths to it.
 	if err := os.MkdirAll("/etc/hedioum", 0755); err != nil {
 		fail("cannot create /etc/hedioum: %v", err)
 	}
@@ -67,17 +75,11 @@ func cmdInstall(args []string) {
 		fail("cannot locate the running binary: %v", err)
 	}
 
-	// Copy self -> temp -> atomic rename, so replacing a running binary does not
-	// hit "text file busy".
 	if err := copyExecutable(self, installBinPath); err != nil {
 		fail("failed to install binary: %v", err)
 	}
 	color.Green("[✓] Binary installed to %s", installBinPath)
 
-	// Render the unit for the role already configured on this box, if any. A fresh
-	// install with no config yet is TUN-capable by default (the hub is the TUN user);
-	// setup-foreign later re-renders it locked-down. This keeps the foreign minimal
-	// while ensuring the hub has CAP_NET_ADMIN ready for an opt-in TUN.
 	tunCapable := true
 	if cfg, err := config.LoadConfig(); err == nil && cfg.Role == "foreign" {
 		tunCapable = false
@@ -97,15 +99,16 @@ func cmdInstall(args []string) {
 	color.HiWhite("  Then:    systemctl start hedioum.service")
 }
 
-// enableBBR turns on the BBR congestion control + fq qdisc, a large throughput
-// win on high-latency/lossy links. Best-effort; ignored on kernels without BBR.
+// enableBBR applies congestion control plus symmetric receive/send ceilings. The
+// name is kept for compatibility with the existing installer flow, but this now
+// also prevents one endpoint's smaller TCP receive window from becoming a hidden
+// one-way throughput cap. Best-effort: unsupported sysctls do not abort install.
 func enableBBR() {
-	const conf = "net.core.default_qdisc=fq\nnet.ipv4.tcp_congestion_control=bbr\n"
-	if err := os.WriteFile("/etc/sysctl.d/99-hedioum-bbr.conf", []byte(conf), 0644); err != nil {
+	if err := os.WriteFile("/etc/sysctl.d/99-hedioum-bbr.conf", []byte(networkSysctlConfig), 0644); err != nil {
 		return
 	}
 	if err := exec.Command("sysctl", "-p", "/etc/sysctl.d/99-hedioum-bbr.conf").Run(); err == nil {
-		color.Green("[✓] Enabled BBR congestion control (fq qdisc).")
+		color.Green("[✓] Enabled BBR/fq and symmetric high-BDP network buffers.")
 	}
 }
 
@@ -130,11 +133,9 @@ func copyExecutable(src, dst string) error {
 		os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, dst) // atomic replace
+	return os.Rename(tmp, dst)
 }
 
-// cmdUpdate updates the binary from GitHub, or installs a locally-provided one
-// (--file) when GitHub is blocked. Both use the backup/rollback flow.
 func cmdUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	file := fs.String("file", "", "install from a local binary instead of downloading")
@@ -146,7 +147,6 @@ func cmdUpdate(args []string) {
 	sysutil.SelfUpdate(AppVersion)
 }
 
-// cmdUninstall stops, disables, and removes everything (non-interactive with --yes).
 func cmdUninstall(args []string) {
 	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
 	yes := fs.Bool("yes", false, "confirm removal of the daemon, config, and binary")
@@ -154,5 +154,5 @@ func cmdUninstall(args []string) {
 	if !*yes {
 		fail("refusing without --yes (this removes the daemon, config, and binary)")
 	}
-	sysutil.Uninstall() // performs the removal and exits
+	sysutil.Uninstall()
 }

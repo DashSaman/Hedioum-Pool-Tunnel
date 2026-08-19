@@ -14,12 +14,26 @@ import (
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/mimic"
 )
 
-// hubYamuxConfig tunes Yamux for high-latency, high-throughput WAN links.
+const (
+	yamuxStreamWindow = 16 << 20
+	yamuxOpenTimeout  = 20 * time.Second
+	yamuxWriteTimeout = 30 * time.Second
+	yamuxCloseTimeout = 5 * time.Minute
+	yamuxBacklog      = 1024
+	dialRaceStagger   = 125 * time.Millisecond
+)
+
+// hubYamuxConfig tunes Yamux for high-latency, high-throughput WAN links. The
+// egress uses the same window/timeout values so either transfer direction gets
+// identical bandwidth-delay-product headroom.
 func hubYamuxConfig() *yamux.Config {
 	c := yamux.DefaultConfig()
-	c.EnableKeepAlive = false        // we run a custom randomized heartbeat
-	c.MaxStreamWindowSize = 16 << 20 // 16MB: headroom for 200-300 Mbps at high RTT
-	c.StreamCloseTimeout = 3 * time.Minute
+	c.EnableKeepAlive = false // we run a custom randomized heartbeat
+	c.AcceptBacklog = yamuxBacklog
+	c.ConnectionWriteTimeout = yamuxWriteTimeout
+	c.MaxStreamWindowSize = yamuxStreamWindow
+	c.StreamOpenTimeout = yamuxOpenTimeout
+	c.StreamCloseTimeout = yamuxCloseTimeout
 	return c
 }
 
@@ -28,8 +42,6 @@ func clientMimicFor(ep config.Endpoint, token string) mimic.ClientMimic {
 	switch ep.Mimic {
 	case "tls", "smtps", "imaps", "directadmin", "https-alt", "docker", "grafana", "prometheus",
 		"cpanel", "whm", "webmail":
-		// Implicit TLS: every panel/registry persona shares the plain TLS mimic on its
-		// own port (the disguise is server-side: the decoy shown to unauthorized probes).
 		return &mimic.TLSClient{Token: token, ServerName: ep.ServerName}
 	case "smtp", "imap", "postgres", "mysql":
 		return &mimic.StartTLSClient{Proto: ep.Mimic, TLS: &mimic.TLSClient{Token: token, ServerName: ep.ServerName}}
@@ -41,18 +53,19 @@ func clientMimicFor(ep config.Endpoint, token string) mimic.ClientMimic {
 // DialEndpoint dials one endpoint: TCP connect, mimic handshake, Yamux client.
 // Shared by the pool dialer and the speedtest CLI.
 func DialEndpoint(ep config.Endpoint, token string, cfg *yamux.Config) (*yamux.Session, error) {
-	conn, err := net.DialTimeout("tcp", ep.Target, 8*time.Second)
+	dialer := net.Dialer{Timeout: 8 * time.Second, KeepAlive: 30 * time.Second}
+	conn, err := dialer.Dial("tcp", ep.Target)
 	if err != nil {
 		return nil, err
 	}
 	secureConn, err := clientMimicFor(ep, token).Dial(conn)
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("%s mimic handshake failed: %w", ep.Mimic, err)
 	}
 	session, err := yamux.Client(secureConn, cfg)
 	if err != nil {
-		secureConn.Close()
+		_ = secureConn.Close()
 		return nil, err
 	}
 	return session, nil
@@ -60,30 +73,27 @@ func DialEndpoint(ep config.Endpoint, token string, cfg *yamux.Config) (*yamux.S
 
 // ProbeEndpoint dials one endpoint end-to-end (TCP + mimic handshake + yamux) and
 // pings it through the tunnel to confirm the egress is actually alive, returning
-// the round-trip latency. It tears the probe connection down before returning. The
-// `probe` command uses it to report which mimics on a node are reachable and which
-// are blocked (wrong port, censored protocol, dead egress).
+// the round-trip latency.
 func ProbeEndpoint(ep config.Endpoint, token string) (time.Duration, error) {
 	sess, err := DialEndpoint(ep, token, hubYamuxConfig())
 	if err != nil {
 		return 0, err
 	}
 	defer sess.Close()
-	return sess.Ping() // real round-trip through the mux -> proves the pipe works
+	return sess.Ping()
 }
 
 // endpointDialer spreads new physical pipes across a node's endpoints with random
-// per-node weights (Chaos Mesh v2 — no fixed "10 SSH + 0 others" signature), and
-// tracks per-endpoint reachability so a censored entry port (e.g. an ISP that drops
-// outbound :22) is detected, skipped, and periodically retried. Each dial races across
-// candidate ports, so the tunnel still comes up when some ports are blocked.
+// per-node weights and reachability memory. One pool dial uses a staggered parallel
+// race, so a black-holed port does not serialize several 8-second timeouts before a
+// healthy 443/8443 path is attempted.
 type endpointDialer struct {
 	node    config.ForeignNode
 	cfg     *yamux.Config
 	weights []float64
 
 	mu     sync.Mutex
-	health map[string]*epHealth // keyed by endpoint.Target
+	health map[string]*epHealth
 }
 
 type epHealth struct {
@@ -92,14 +102,12 @@ type epHealth struct {
 }
 
 const (
-	dialMaxAttempts = 4                // candidate ports tried per dial (bounds a down-node stall)
-	epFailThreshold = 2                // consecutive fails before an endpoint is cooled down
-	epCooldownBase  = 60 * time.Second // first cooldown for a blocked endpoint (doubles per extra fail)
+	dialMaxAttempts = 4
+	epFailThreshold = 2
+	epCooldownBase  = 60 * time.Second
 	epCooldownMax   = 10 * time.Minute
 )
 
-// dialPriority orders fallback attempts by how likely a port is to be reachable from
-// a censored network: 443/8443 first, ssh last (it is the most commonly blocked).
 var dialPriority = map[string]int{
 	"tls": 0, "https-alt": 1,
 	"smtps": 2, "imaps": 2, "directadmin": 2, "cpanel": 2, "whm": 2, "webmail": 2,
@@ -117,15 +125,13 @@ func dialRank(m string) int {
 func newEndpointDialer(node config.ForeignNode) *endpointDialer {
 	w := make([]float64, len(node.Endpoints))
 	for i := range w {
-		w[i] = 0.3 + mrand.Float64() // per-node random bias
+		w[i] = 0.3 + mrand.Float64()
 	}
 	return &endpointDialer{node: node, cfg: hubYamuxConfig(), weights: w, health: map[string]*epHealth{}}
 }
 
-// attemptOrder returns the endpoints to try for one dial, best-first: a weighted-
-// random primary pick among currently-reachable endpoints (for mimic diversity), then
-// the remaining reachable endpoints in innocuous-port-first order, then any
-// cooling-down endpoints as a last resort. Capped at dialMaxAttempts.
+// attemptOrder returns endpoints best-first: a weighted-random primary for mimic
+// diversity, then reachable innocuous ports, then cooling endpoints as last resort.
 func (d *endpointDialer) attemptOrder() []config.Endpoint {
 	eps := d.node.Endpoints
 	if len(eps) <= 1 {
@@ -144,8 +150,11 @@ func (d *endpointDialer) attemptOrder() []config.Endpoint {
 	d.mu.Unlock()
 
 	pool := reachable
-	if len(pool) == 0 { // everything cooled down — try anyway, the block may have lifted
+	if len(pool) == 0 {
 		pool, cooling = cooling, nil
+	}
+	if len(pool) == 0 {
+		return nil
 	}
 
 	primary := d.weightedPick(pool)
@@ -173,7 +182,6 @@ func (d *endpointDialer) attemptOrder() []config.Endpoint {
 	return out
 }
 
-// weightedPick returns a weighted-random index from the candidate indices.
 func (d *endpointDialer) weightedPick(cand []int) int {
 	if len(cand) == 1 {
 		return cand[0]
@@ -217,31 +225,81 @@ func (d *endpointDialer) recordFailure(target string) {
 	d.mu.Unlock()
 }
 
-// dial establishes one physical pipe, racing across candidate ports so a censored
-// entry port does not stop the tunnel from coming up. The first port that completes
-// the mimic handshake wins; failures cool the port down so it is skipped next time.
+type dialResult struct {
+	session *yamux.Session
+	mimic   string
+	target  string
+	err     error
+}
+
+// dial performs a REAL staggered race across candidate endpoints. The first fully
+// authenticated Yamux session wins. Losing successful sessions are closed, and
+// failed endpoints update cooldown memory.
 func (d *endpointDialer) dial() (*yamux.Session, string, error) {
+	attempts := d.attemptOrder()
+	if len(attempts) == 0 {
+		return nil, "", fmt.Errorf("node %q has no endpoints to dial", d.node.Alias)
+	}
+
+	results := make(chan dialResult, len(attempts))
+	done := make(chan struct{})
+
+	for i, ep := range attempts {
+		delay := time.Duration(i) * dialRaceStagger
+		go func(ep config.Endpoint, delay time.Duration) {
+			if delay > 0 {
+				t := time.NewTimer(delay)
+				defer t.Stop()
+				select {
+				case <-done:
+					return
+				case <-t.C:
+				}
+			}
+
+			session, err := DialEndpoint(ep, d.node.AuthToken, d.cfg)
+			if err != nil {
+				d.recordFailure(ep.Target)
+				select {
+				case results <- dialResult{mimic: ep.Mimic, target: ep.Target, err: err}:
+				case <-done:
+				}
+				return
+			}
+
+			d.recordSuccess(ep.Target)
+			select {
+			case results <- dialResult{session: session, mimic: ep.Mimic, target: ep.Target}:
+			case <-done:
+				_ = session.Close()
+			}
+		}(ep, delay)
+	}
+
 	var lastErr error
-	for _, ep := range d.attemptOrder() {
-		session, err := DialEndpoint(ep, d.node.AuthToken, d.cfg)
-		if err != nil {
-			d.recordFailure(ep.Target)
-			slog.Warn("pipe dial failed", "node", d.node.Alias, "mimic", ep.Mimic, "target", ep.Target, "err", err)
-			lastErr = err
+	for range attempts {
+		r := <-results
+		if r.err != nil {
+			slog.Warn("pipe dial failed", "node", d.node.Alias, "mimic", r.mimic, "target", r.target, "err", r.err)
+			lastErr = r.err
 			continue
 		}
-		d.recordSuccess(ep.Target)
-		slog.Info("pipe established", "node", d.node.Alias, "mimic", ep.Mimic, "target", ep.Target)
-		go keepAlive(session)
-		return session, ep.Mimic, nil
+
+		close(done)
+		slog.Info("pipe established", "node", d.node.Alias, "mimic", r.mimic, "target", r.target)
+		go keepAlive(r.session)
+		return r.session, r.mimic, nil
 	}
+
 	if lastErr == nil {
-		lastErr = fmt.Errorf("node %q has no endpoints to dial", d.node.Alias)
+		lastErr = fmt.Errorf("node %q: all endpoint attempts failed", d.node.Alias)
 	}
 	return nil, "", lastErr
 }
 
-// keepAlive sends a randomized-interval Yamux ping to evade DPI periodicity checks.
+// keepAlive sends a randomized-interval Yamux ping. A failed ping actively closes
+// the session so pool health sees it as dead immediately instead of retaining a
+// zombie transport until a later user stream happens to fail.
 func keepAlive(s *yamux.Session) {
 	for {
 		if s.IsClosed() {
@@ -249,6 +307,7 @@ func keepAlive(s *yamux.Session) {
 		}
 		time.Sleep(time.Duration(mrand.IntN(26)+20) * time.Second)
 		if _, err := s.Ping(); err != nil {
+			_ = s.Close()
 			return
 		}
 	}

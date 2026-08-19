@@ -5,6 +5,7 @@ import (
 	"net"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStreamTypeAndTCPHeader(t *testing.T) {
@@ -106,7 +107,6 @@ func TestDatagramMultipleInStream(t *testing.T) {
 }
 
 func TestSocksUDPHeaderParseAndBuild(t *testing.T) {
-	// Build a SOCKS5 UDP request header + data by hand: RSV(0,0) FRAG(0) ATYP=1 IP PORT DATA
 	pkt := []byte{0x00, 0x00, 0x00, 0x01, 8, 8, 4, 4, 0x00, 0x35}
 	pkt = append(pkt, []byte("dnsquery")...)
 
@@ -121,7 +121,6 @@ func TestSocksUDPHeaderParseAndBuild(t *testing.T) {
 		t.Fatalf("data = %q", pkt[off:])
 	}
 
-	// Round-trip back to a SOCKS reply header.
 	reply := BuildSocksUDPHeader(addr, []byte("dnsreply"))
 	addr2, off2, err := ParseSocksUDPHeader(reply)
 	if err != nil {
@@ -133,7 +132,7 @@ func TestSocksUDPHeaderParseAndBuild(t *testing.T) {
 }
 
 func TestSocksUDPHeaderRejectsFragment(t *testing.T) {
-	pkt := []byte{0x00, 0x00, 0x02, 0x01, 8, 8, 4, 4, 0x00, 0x35} // FRAG=2
+	pkt := []byte{0x00, 0x00, 0x02, 0x01, 8, 8, 4, 4, 0x00, 0x35}
 	if _, _, err := ParseSocksUDPHeader(pkt); err == nil {
 		t.Fatal("fragmented datagram must be rejected")
 	}
@@ -154,6 +153,21 @@ func TestSpeedtestHeader(t *testing.T) {
 	}
 	if dir != SpeedDown || seconds != 15 {
 		t.Fatalf("dir=%#x seconds=%d", dir, seconds)
+	}
+}
+
+func TestSpeedtestResultRoundTrip(t *testing.T) {
+	want := SpeedtestResult{Bytes: 987654321, Elapsed: 1500 * time.Millisecond}
+	var buf bytes.Buffer
+	if err := WriteSpeedtestResult(&buf, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := ReadSpeedtestResult(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Bytes != want.Bytes || got.Elapsed != want.Elapsed {
+		t.Fatalf("result=%+v want=%+v", got, want)
 	}
 }
 

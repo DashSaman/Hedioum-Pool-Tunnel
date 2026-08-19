@@ -2,6 +2,8 @@ package egress
 
 import (
 	"encoding/binary"
+	"errors"
+	"io"
 	mrand "math/rand/v2"
 	"net"
 	"time"
@@ -10,13 +12,15 @@ import (
 )
 
 const (
-	speedtestMaxSeconds = 30
+	speedtestMaxSeconds = 300
 	speedtestChunk      = 64 * 1024
+	speedtestTailGrace  = 15 * time.Second
 )
 
-// handleSpeedtestStream measures raw tunnel capacity: on a download it streams
-// random data for the requested (capped) duration; on an upload it drains. It is
-// intentionally NOT rate-shaped — it reports the pipe's true throughput.
+// handleSpeedtestStream measures raw tunnel capacity. Download is counted by the
+// hub receiver. Upload is counted HERE at the foreign receiver and returned as a
+// SpeedtestResult after the hub half-closes its write side, so queued Yamux bytes
+// can no longer masquerade as delivered upload throughput.
 func handleSpeedtestStream(stream net.Conn) {
 	dir, seconds, err := tunproto.ReadSpeedtestHeader(stream)
 	if err != nil {
@@ -25,10 +29,10 @@ func handleSpeedtestStream(stream net.Conn) {
 	if seconds == 0 || seconds > speedtestMaxSeconds {
 		seconds = speedtestMaxSeconds
 	}
-	deadline := time.Now().Add(time.Duration(seconds) * time.Second)
 
 	switch dir {
 	case tunproto.SpeedDown:
+		deadline := time.Now().Add(time.Duration(seconds) * time.Second)
 		buf := make([]byte, speedtestChunk)
 		fillPseudoRandom(buf)
 		for time.Now().Before(deadline) {
@@ -36,14 +40,26 @@ func handleSpeedtestStream(stream net.Conn) {
 				return
 			}
 		}
+
 	case tunproto.SpeedUp:
-		_ = stream.SetReadDeadline(deadline)
+		start := time.Now()
+		_ = stream.SetReadDeadline(start.Add(time.Duration(seconds)*time.Second + speedtestTailGrace))
 		buf := make([]byte, speedtestChunk)
+		var total uint64
 		for {
-			if _, err := stream.Read(buf); err != nil {
-				return
+			n, readErr := stream.Read(buf)
+			total += uint64(n)
+			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) {
+					return
+				}
+				break
 			}
 		}
+		elapsed := time.Since(start)
+		_ = stream.SetReadDeadline(time.Time{})
+		_ = stream.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		_ = tunproto.WriteSpeedtestResult(stream, tunproto.SpeedtestResult{Bytes: total, Elapsed: elapsed})
 	}
 }
 

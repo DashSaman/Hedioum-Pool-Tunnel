@@ -19,7 +19,7 @@ const (
 	// stagePath is deliberately in the SAME directory as binaryPath so the final
 	// swap is an atomic same-filesystem rename (a /tmp staging area risks EXDEV).
 	stagePath = "/usr/local/bin/hedioum-tunnel.new"
-	repoAPI   = "https://api.github.com/repos/hedioum/Hedioum-Pool-Tunnel/releases/latest"
+	repoAPI   = "https://api.github.com/repos/DashSaman/Hedioum-Pool-Tunnel/releases/latest"
 
 	minBinarySize    = 1024 * 1024 // sanity floor for a real binary
 	downloadAttempts = 3
@@ -81,7 +81,7 @@ func UpdateFromFile(path string) {
 	installStaged("manual:" + path)
 }
 
-// fetchLatestRelease queries the GitHub releases API.
+// fetchLatestRelease queries this fork's GitHub releases API.
 func fetchLatestRelease() (*GitHubRelease, error) {
 	client := http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Get(repoAPI)
@@ -135,7 +135,7 @@ func downloadWithRetry(url, dst string, attempts int) error {
 }
 
 func manualHint() {
-	color.Yellow("    GitHub may be blocked. Download '%s' manually and run:", targetAsset())
+	color.Yellow("    GitHub may be blocked. Download '%s' manually from DashSaman/Hedioum-Pool-Tunnel Releases and run:", targetAsset())
 	color.HiWhite("      hedioum-tunnel update --file /path/to/%s", targetAsset())
 }
 

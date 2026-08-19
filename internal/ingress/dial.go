@@ -12,30 +12,14 @@ import (
 	"github.com/hashicorp/yamux"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/config"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/mimic"
+	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/muxcfg"
 )
 
-const (
-	yamuxStreamWindow = 16 << 20
-	yamuxOpenTimeout  = 20 * time.Second
-	yamuxWriteTimeout = 30 * time.Second
-	yamuxCloseTimeout = 5 * time.Minute
-	yamuxBacklog      = 1024
-	dialRaceStagger   = 125 * time.Millisecond
-)
+const dialRaceStagger = 125 * time.Millisecond
 
-// hubYamuxConfig tunes Yamux for high-latency, high-throughput WAN links. The
-// egress uses the same window/timeout values so either transfer direction gets
-// identical bandwidth-delay-product headroom.
-func hubYamuxConfig() *yamux.Config {
-	c := yamux.DefaultConfig()
-	c.EnableKeepAlive = false // we run a custom randomized heartbeat
-	c.AcceptBacklog = yamuxBacklog
-	c.ConnectionWriteTimeout = yamuxWriteTimeout
-	c.MaxStreamWindowSize = yamuxStreamWindow
-	c.StreamOpenTimeout = yamuxOpenTimeout
-	c.StreamCloseTimeout = yamuxCloseTimeout
-	return c
-}
+// hubYamuxConfig returns the same high-latency/high-throughput profile used by
+// the egress. Keeping both ends on muxcfg.WAN prevents directional window drift.
+func hubYamuxConfig() *yamux.Config { return muxcfg.WAN() }
 
 // clientMimicFor builds the client camouflage for an endpoint's mimic type.
 func clientMimicFor(ep config.Endpoint, token string) mimic.ClientMimic {

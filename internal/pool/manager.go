@@ -21,25 +21,19 @@ const (
 	staggerDelay    = 500 * time.Millisecond
 	healthCheckFreq = 10 * time.Second
 
-	// A draining pipe with no streams closes immediately. A pipe that still owns a
-	// logical stream is closed only after it has had no real payload activity for
-	// the grace period. There is deliberately no wall-clock hard kill for an active
-	// transfer: long downloads, calls and WebSockets must be allowed to finish.
-	drainSoftGrace = 90 * time.Second
-
 	// The lifecycle code keeps normal operation below 2x max (active + draining).
 	// 3x is only a safety ceiling for legacy/edge states and lets us recover active
 	// capacity without force-closing a genuinely live drainer.
 	maxTotalFactor = 3
 )
 
-// shouldCloseDraining decides whether a draining pipe may be closed now. Live
-// traffic is never killed just because a wall-clock deadline elapsed.
-func shouldCloseDraining(streams int, drainedFor time.Duration, idle bool) bool {
-	if streams == 0 {
-		return true
-	}
-	return idle && drainedFor > drainSoftGrace
+// shouldCloseDraining is intentionally strict: a physical pipe is reusable only
+// for its already-open streams after entering Draining, and it is closed only when
+// every logical user stream has actually ended. Quiet WebSockets, SSH sessions,
+// long polling and voice control channels can legitimately carry no payload for
+// minutes; inactivity alone is never permission to disconnect them.
+func shouldCloseDraining(streams int, _ time.Duration, _ bool) bool {
+	return streams == 0
 }
 
 // DialFunc creates a new authenticated physical connection and reports which mimic
@@ -174,15 +168,16 @@ func (hm *HubManager) lookup(nodeAlias string) (*nodePools, error) {
 }
 
 type streamCandidate struct {
-	s       *YamuxSession
-	streams int
+	s           *YamuxSession
+	streams     int
+	recentBytes uint64
 }
 
 // getStreamLeastLoaded snapshots candidates under the pool lock, RELEASES the
 // lock, then calls Yamux OpenStream. OpenStream can block while waiting for a peer
 // ACK, so holding the pool lock across it can freeze the watchdog/replenisher.
-// If the best session races with a disconnect, the next candidate is tried before
-// failing the user connection.
+// Candidates are ordered first by logical-stream count and then by recent bytes so
+// a bulk transfer does not attract additional flows merely because of a tie.
 func (np *NodePool) getStreamLeastLoaded() (net.Conn, error) {
 	np.mu.RLock()
 	candidates := make([]streamCandidate, 0, len(np.sessions))
@@ -190,12 +185,19 @@ func (np *NodePool) getStreamLeastLoaded() (net.Conn, error) {
 		if s.IsClosed() || !s.IsActive() {
 			continue
 		}
-		candidates = append(candidates, streamCandidate{s: s, streams: s.ActiveStreams()})
+		candidates = append(candidates, streamCandidate{
+			s:           s,
+			streams:     s.ActiveStreams(),
+			recentBytes: s.RecentBytes(),
+		})
 	}
 	np.mu.RUnlock()
 
 	sort.SliceStable(candidates, func(i, j int) bool {
-		return candidates[i].streams < candidates[j].streams
+		if candidates[i].streams != candidates[j].streams {
+			return candidates[i].streams < candidates[j].streams
+		}
+		return candidates[i].recentBytes < candidates[j].recentBytes
 	})
 
 	var lastErr error
@@ -206,15 +208,24 @@ func (np *NodePool) getStreamLeastLoaded() (net.Conn, error) {
 		}
 		lastErr = err
 		// A stream-open failure means this physical session is no longer a safe
-		// candidate. Close it immediately so subsequent requests do not stall on
-		// the same zombie until the next watchdog tick.
+		// candidate. Close it immediately, and start replacing the lost capacity in
+		// the background even if another candidate succeeds for this user request.
 		_ = c.s.Close()
+		np.replenishAsync(1)
 		slog.Debug("yamux stream open failed; closed pipe and trying another", "node", np.Alias, "pool", np.label, "err", err)
 	}
 
-	// Do not make a client request responsible for rebuilding the whole pool. Kick
-	// recovery in the background; Xray/SOCKS callers can retry immediately.
-	np.replenishAsync(1)
+	// If the pool is empty/starved, request the whole missing baseline rather than
+	// a single pipe. This shortens recovery after a route outage while dialing stays
+	// asynchronous to the user request.
+	np.mu.RLock()
+	currentActive := np.activeCountLocked()
+	np.mu.RUnlock()
+	needed := np.minConnections - currentActive
+	if needed < 1 {
+		needed = 1
+	}
+	np.replenishAsync(needed)
 	if lastErr != nil {
 		return nil, fmt.Errorf("no usable active connection in pool: %w", lastErr)
 	}
@@ -241,13 +252,15 @@ func (np *NodePool) monitorAndScale() {
 }
 
 // evaluateHealthAndScale calculates throughput, lifecycle state, and scale dynamics.
+// Retirement is make-before-break with respect to the configured active floor: a
+// health tick can never drain enough pipes to take the pool below minConnections.
 func (np *NodePool) evaluateHealthAndScale() {
 	np.mu.Lock()
 	retainedSessions := make([]*YamuxSession, 0, len(np.sessions))
 
 	dynamicIdleLimit := time.Duration(rand.Intn(61)+60) * time.Second
 	needsScaleUp := false
-	activeCount := 0
+	activeRemaining := np.activeCountLocked()
 	drainingCount := np.drainingCountLocked()
 	totalPoolMbps := 0
 
@@ -267,28 +280,32 @@ func (np *NodePool) evaluateHealthAndScale() {
 		cap := s.CurrentCap()
 
 		if s.IsActive() {
-			activeCount++
+			retireRequested := s.ShouldRetire()
 
-			// Never let lifecycle churn create an unbounded wall of drainers. If the
-			// drainer budget is full, defer retirement until existing live streams
-			// naturally finish instead of killing one to make room.
-			if s.ShouldRetire() && drainingCount < np.maxConnections {
+			// Lifecycle retirement may consume spare active capacity, but NEVER the
+			// configured warm floor. At the floor we first request a replacement and
+			// defer this retirement to a later health tick (make-before-break).
+			if retireRequested && drainingCount < np.maxConnections && activeRemaining > np.minConnections {
 				s.SetDraining()
-				activeCount--
+				activeRemaining--
 				drainingCount++
 				slog.Info("retired: lifecycle budget reached", "node", np.Alias, "pool", np.label,
 					"mimic", s.mimicType, "age", s.Age().Round(time.Second), "mb", s.CumulativeBytes()/(1024*1024))
 			} else {
+				if retireRequested && activeRemaining <= np.minConnections && activeRemaining < np.maxConnections {
+					needsScaleUp = true
+				}
 				if mbps >= int(float64(cap)*0.8) {
 					needsScaleUp = true
 				}
 
-				// Scale down only truly unused pipes. A low-bandwidth live stream (voice,
-				// WebSocket, keepalive traffic) is not an idle connection.
-				if activeCount > np.minConnections && drainingCount < np.maxConnections &&
+				// Scale down only a completely unused pipe, and base the decision on the
+				// TOTAL active capacity remaining rather than the position in the slice.
+				// The old partial counter made scale-down order-dependent.
+				if !retireRequested && activeRemaining > np.minConnections && drainingCount < np.maxConnections &&
 					s.ActiveStreams() == 0 && s.IdleTime() > dynamicIdleLimit {
 					s.SetDraining()
-					activeCount--
+					activeRemaining--
 					drainingCount++
 					slog.Info("scaled down: unused connection draining", "node", np.Alias, "pool", np.label)
 				}
@@ -296,12 +313,11 @@ func (np *NodePool) evaluateHealthAndScale() {
 		} else if s.IsDraining() {
 			streams := s.ActiveStreams()
 			drainedFor := s.DrainingFor()
-			idle := s.IdleTime() > drainSoftGrace
-			if shouldCloseDraining(streams, drainedFor, idle) {
-				s.Close()
+			if shouldCloseDraining(streams, drainedFor, false) {
+				_ = s.Close()
 				drainingCount--
 				slog.Info("draining complete: connection closed", "node", np.Alias, "pool", np.label,
-					"streams", streams, "drained_for", drainedFor.Round(time.Second), "idle", idle)
+					"streams", streams, "drained_for", drainedFor.Round(time.Second))
 				continue
 			}
 		}
@@ -351,17 +367,14 @@ func (np *NodePool) drainingCountLocked() int {
 	return n
 }
 
-// evictOldestSafeDrainingLocked frees a slot only from a drainer that is already
-// empty or genuinely idle. It never sacrifices a live transfer to replenish the
-// pool. Caller holds np.mu.
+// evictOldestSafeDrainingLocked frees a slot only from a drainer with ZERO open
+// streams. An idle-but-open stream is still a real user connection and must never
+// be sacrificed for pool housekeeping. Caller holds np.mu.
 func (np *NodePool) evictOldestSafeDrainingLocked() bool {
 	idx := -1
 	var oldest time.Duration
 	for i, s := range np.sessions {
-		if !s.IsDraining() {
-			continue
-		}
-		if s.ActiveStreams() > 0 && s.IdleTime() <= drainSoftGrace {
+		if !s.IsDraining() || s.ActiveStreams() > 0 {
 			continue
 		}
 		if d := s.DrainingFor(); idx == -1 || d > oldest {
@@ -371,14 +384,15 @@ func (np *NodePool) evictOldestSafeDrainingLocked() bool {
 	if idx == -1 {
 		return false
 	}
-	np.sessions[idx].Close()
-	slog.Info("evicted safe draining connection", "node", np.Alias, "pool", np.label,
+	_ = np.sessions[idx].Close()
+	slog.Info("evicted empty draining connection to free a slot", "node", np.Alias, "pool", np.label,
 		"drained_for", oldest.Round(time.Second))
 	np.sessions = append(np.sessions[:idx], np.sessions[idx+1:]...)
 	return true
 }
 
-// executeScaleUp requests a fresh physical connection under load.
+// executeScaleUp dials a fresh physical connection under load or before a deferred
+// lifecycle retirement. The actual dial remains asynchronous.
 func (np *NodePool) executeScaleUp() {
 	np.mu.RLock()
 	activeConns := np.activeCountLocked()
@@ -447,10 +461,18 @@ func (np *NodePool) compactClosedLocked() {
 
 func (np *NodePool) replenishPool(needed int) {
 	for i := 0; i < needed; i++ {
-		select {
-		case <-np.shutdown:
-			return
-		case <-time.After(staggerDelay):
+		// The first pipe after total starvation is latency-critical: dial it
+		// immediately. Normal scale-up and subsequent warm-up dials stay staggered so
+		// reconnect storms do not hammer one egress endpoint all at once.
+		np.mu.RLock()
+		activeBeforeDial := np.activeCountLocked()
+		np.mu.RUnlock()
+		if i > 0 || activeBeforeDial > 0 {
+			select {
+			case <-np.shutdown:
+				return
+			case <-time.After(staggerDelay):
+			}
 		}
 
 		rawYamuxSession, mimicType, err := np.dialer()
@@ -461,7 +483,7 @@ func (np *NodePool) replenishPool(needed int) {
 
 		select {
 		case <-np.shutdown:
-			rawYamuxSession.Close()
+			_ = rawYamuxSession.Close()
 			return
 		default:
 		}
@@ -472,14 +494,14 @@ func (np *NodePool) replenishPool(needed int) {
 		np.compactClosedLocked()
 		switch {
 		case np.activeCountLocked() >= np.maxConnections:
-			wrappedSession.Close()
+			_ = wrappedSession.Close()
 		case len(np.sessions) >= maxTotalFactor*np.maxConnections:
 			if np.evictOldestSafeDrainingLocked() {
 				np.sessions = append(np.sessions, wrappedSession)
 			} else {
 				// Safety ceiling reached with only genuinely live drainers. Do not cut
 				// user traffic; reject this extra pipe and retry after streams finish.
-				wrappedSession.Close()
+				_ = wrappedSession.Close()
 				slog.Warn("session safety ceiling reached; preserving live drainers",
 					"node", np.Alias, "pool", np.label, "total", len(np.sessions))
 			}
@@ -554,7 +576,7 @@ func (np *NodePool) cleanup() {
 	np.mu.Lock()
 	defer np.mu.Unlock()
 	for _, session := range np.sessions {
-		session.Close()
+		_ = session.Close()
 	}
 	np.sessions = nil
 }

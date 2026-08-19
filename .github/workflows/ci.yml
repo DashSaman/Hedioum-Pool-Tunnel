@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'agent/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Format check
+        run: |
+          files="$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
+          if [ -n "$files" ]; then
+            echo "These files need gofmt:"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Unit and integration tests
+        run: go test ./...
+
+      - name: Race detector on data plane
+        run: go test -race ./internal/pool ./internal/ingress ./internal/egress ./internal/securestream ./internal/pipe
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build Linux binary
+        run: go build -trimpath -o /tmp/hedioum-tunnel ./cmd/hedioum

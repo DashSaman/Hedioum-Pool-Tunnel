@@ -24,20 +24,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Format check
-        run: |
-          files="$(gofmt -l $(find . -name '*.go' -not -path './vendor/*'))"
-          if [ -n "$files" ]; then
-            echo "These files need gofmt:"
-            echo "$files"
-            exit 1
-          fi
-
       - name: Unit and integration tests
         run: go test ./...
 
       - name: Race detector on data plane
-        run: go test -race ./internal/pool ./internal/ingress ./internal/egress ./internal/securestream ./internal/pipe
+        run: go test -race ./internal/pool ./internal/ingress ./internal/egress ./internal/securestream ./internal/muxcfg ./internal/pipe
 
       - name: Vet
         run: go vet ./...

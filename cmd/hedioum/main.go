@@ -18,17 +18,13 @@ import (
 )
 
 // AppVersion defines the current build version for the self-updater.
-// CRITICAL: This must match the GitHub Release Tag exactly (e.g., v0.6.0)
+// It matches the fork release tag produced by .github/workflows/fork-release.yml.
 //
-// v0.11.0 adds transparent L3 Gateway mode (--gateway): a hub — especially a
-// single container on MikroTik/RouterOS or any Linux router — forwards transit
-// traffic that arrives on its LAN-facing interface into the tunnel, so a whole LAN
-// egresses through the disguised tunnel with no per-device change and no external
-// proxy. Built on the 0.10 TUN engine (gVisor); routing via netlink (iif rule +
-// ip_forward), with a RouterOS-7.22 ip-rule-priority guard. Validated end-to-end on
-// a real RouterOS CHR and on a plain Linux router. Wire protocol UNCHANGED since
-// v0.8.0; gateway/TUN are hub-side only, so v0.11 hubs interoperate with v0.9 foreigns.
-const AppVersion = "v0.11.0"
+// v0.11.1-pv1 is the DashSaman stability/throughput hardening fork based on
+// upstream v0.11.0: unthrottled hot data path, symmetric high-RTT Yamux windows,
+// non-blocking pool recovery, lossless TCP half-close, real endpoint racing, and
+// hardened UDP flow lifecycle/timer handling. Wire framing remains compatible.
+const AppVersion = "v0.11.1-pv1"
 
 func main() {
 	// Management subcommands (a non-flag first argument): install, setup-*, etc.

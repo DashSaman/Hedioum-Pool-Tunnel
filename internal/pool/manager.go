@@ -55,21 +55,22 @@ type PoolStats struct {
 
 // NodePool manages an auto-scaling pool of Yamux sessions to a single foreign server.
 type NodePool struct {
-	Alias          string
-	label          string // "tcp" or "udp" — which sub-pool, for observability in logs
-	TargetIP       string
-	minConnections int
-	maxConnections int
-	baseLimitMbps  int
-	jitterMbps     int
-	dialer         DialFunc
-	lifecycle      LifecyclePolicy
-	sessions       []*YamuxSession
-	mu             sync.RWMutex
-	currentMbps    int32 // Atomic total bandwidth of this pool for dashboard monitoring
-	replenishing   int32 // CAS guard: at most one dial/replenish batch per sub-pool
-	shutdown       chan struct{}
-	stopOnce       sync.Once
+	Alias           string
+	label           string // "tcp" or "udp" — which sub-pool, for observability in logs
+	TargetIP        string
+	minConnections  int
+	maxConnections  int
+	baseLimitMbps   int
+	jitterMbps      int
+	dialer          DialFunc
+	lifecycle       LifecyclePolicy
+	sessions        []*YamuxSession
+	mu              sync.RWMutex
+	currentMbps     int32 // Atomic total bandwidth of this pool for dashboard monitoring
+	replenishing    int32 // CAS guard: at most one dial/replenish worker per sub-pool
+	replenishWanted int32 // max outstanding number of fresh pipes requested
+	shutdown        chan struct{}
+	stopOnce        sync.Once
 }
 
 // UDP sub-pool sizing. UDP rides a SEPARATE set of physical connections so a bulk
@@ -204,7 +205,11 @@ func (np *NodePool) getStreamLeastLoaded() (net.Conn, error) {
 			return stream, nil
 		}
 		lastErr = err
-		slog.Debug("yamux stream open failed; trying another pipe", "node", np.Alias, "pool", np.label, "err", err)
+		// A stream-open failure means this physical session is no longer a safe
+		// candidate. Close it immediately so subsequent requests do not stall on
+		// the same zombie until the next watchdog tick.
+		_ = c.s.Close()
+		slog.Debug("yamux stream open failed; closed pipe and trying another", "node", np.Alias, "pool", np.label, "err", err)
 	}
 
 	// Do not make a client request responsible for rebuilding the whole pool. Kick
@@ -385,19 +390,59 @@ func (np *NodePool) executeScaleUp() {
 }
 
 // replenishAsync keeps the health loop non-blocking and coalesces duplicate
-// recovery requests. A failed/filtered endpoint can take seconds to dial; that must
-// never freeze pool maintenance.
+// recovery requests without LOSING a larger request that arrives while a dial batch
+// is already running. replenishWanted stores the maximum outstanding batch size.
 func (np *NodePool) replenishAsync(needed int) {
 	if needed <= 0 {
 		return
 	}
+	atomicMaxInt32(&np.replenishWanted, int32(needed))
 	if !atomic.CompareAndSwapInt32(&np.replenishing, 0, 1) {
 		return
 	}
-	go func() {
-		defer atomic.StoreInt32(&np.replenishing, 0)
-		np.replenishPool(needed)
-	}()
+	go np.replenishWorker()
+}
+
+func atomicMaxInt32(dst *int32, v int32) {
+	for {
+		old := atomic.LoadInt32(dst)
+		if old >= v {
+			return
+		}
+		if atomic.CompareAndSwapInt32(dst, old, v) {
+			return
+		}
+	}
+}
+
+func (np *NodePool) replenishWorker() {
+	for {
+		wanted := int(atomic.SwapInt32(&np.replenishWanted, 0))
+		if wanted > 0 {
+			np.replenishPool(wanted)
+			continue
+		}
+
+		// Publish idle only after the pending counter is empty, then close the race
+		// with a request that may have arrived while replenishing was still 1.
+		atomic.StoreInt32(&np.replenishing, 0)
+		if atomic.LoadInt32(&np.replenishWanted) == 0 {
+			return
+		}
+		if !atomic.CompareAndSwapInt32(&np.replenishing, 0, 1) {
+			return // another caller started the replacement worker
+		}
+	}
+}
+
+func (np *NodePool) compactClosedLocked() {
+	kept := np.sessions[:0]
+	for _, s := range np.sessions {
+		if !s.IsClosed() {
+			kept = append(kept, s)
+		}
+	}
+	np.sessions = kept
 }
 
 func (np *NodePool) replenishPool(needed int) {
@@ -424,6 +469,7 @@ func (np *NodePool) replenishPool(needed int) {
 		wrappedSession := NewYamuxSession(rawYamuxSession, np.baseLimitMbps, np.jitterMbps, mimicType, np.lifecycle)
 
 		np.mu.Lock()
+		np.compactClosedLocked()
 		switch {
 		case np.activeCountLocked() >= np.maxConnections:
 			wrappedSession.Close()

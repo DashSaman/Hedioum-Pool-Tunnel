@@ -2,8 +2,17 @@ package sysutil
 
 import (
 	"runtime"
+	"strings"
 	"testing"
 )
+
+// TestForkUpdateSource prevents the fork from silently reverting to upstream
+// release binaries. Installer and self-updater must remain on DashSaman's repo.
+func TestForkUpdateSource(t *testing.T) {
+	if !strings.Contains(repoAPI, "DashSaman/Hedioum-Pool-Tunnel") {
+		t.Fatalf("self-updater points outside the fork: %q", repoAPI)
+	}
+}
 
 // TestTargetAsset verifies the self-updater picks the binary matching the host
 // architecture — the release-asset names install.sh and the updater rely on.

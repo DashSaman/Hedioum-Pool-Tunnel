@@ -1,6 +1,7 @@
 package ingress
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -97,6 +98,7 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 		slog.Error("failed to bind SOCKS5 listener", "node", node.Alias, "addr", listenAddr, "err", err)
 		return
 	}
+	defer listener.Close()
 
 	if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" {
 		slog.Warn("SOCKS5 bound to a non-loopback address — ensure this network is trusted (open proxy risk)",
@@ -107,6 +109,13 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Accept can fail repeatedly under FD/memory pressure. A small backoff
+			// prevents a resource-exhaustion condition from turning into a 100% CPU spin.
+			slog.Warn("SOCKS5 accept failed; retrying", "node", node.Alias, "err", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 		go handleClientTraffic(clientConn, node.Alias, hubManager)

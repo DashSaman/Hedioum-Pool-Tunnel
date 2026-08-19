@@ -128,7 +128,12 @@ func handleUDPStream(stream net.Conn) {
 			}
 			f = &udpFlow{conn: uconn, target: addr}
 			flows[key] = f
-			f.arm(func() { closeFlow(key, f) })
+
+			// Capture explicit immutable copies for the delayed timer callback. This
+			// avoids any dependence on loop-variable capture semantics and guarantees
+			// an old timer can target only the flow instance that created it.
+			flowKey, flowPtr := key, f
+			f.arm(func() { closeFlow(flowKey, flowPtr) })
 			go udpResponseReader(f, key, stream, &streamWriteMu, closeFlow)
 		}
 		mu.Unlock()

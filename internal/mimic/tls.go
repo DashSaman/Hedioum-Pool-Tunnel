@@ -13,7 +13,9 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
-const tlsHandshakeTimeout = 15 * time.Second
+// Variable (rather than const) only so regression tests can exercise stalled-auth
+// paths without sleeping 15 seconds. Production never mutates it.
+var tlsHandshakeTimeout = 15 * time.Second
 
 // TLSMimic disguises the tunnel as an HTTPS server: a real TLS handshake provides
 // the single crypto layer, and a channel-bound token auth (tlsauth.go) proves the

@@ -12,8 +12,10 @@ import (
 )
 
 const (
-	udpBufSize    = 64 * 1024
-	udpQueueDepth = 256 // bounded outbound queue; UDP drops instead of growing RAM
+	udpBufSize           = 64 * 1024
+	udpQueueDepth        = 4096    // count guard; bytes are bounded separately below
+	udpQueueMaxBytes     = 4 << 20 // at most 4 MiB queued per UDP association
+	udpSocketBufferBytes = 4 << 20 // best-effort kernel burst buffer
 )
 
 // handleUDPAssociate implements SOCKS5 UDP ASSOCIATE. The tunnel stream is opened
@@ -26,6 +28,13 @@ func handleUDPAssociate(ctrlConn net.Conn, nodeAlias string, hubManager *pool.Hu
 		return
 	}
 	defer relay.Close()
+	// UDP has no transport-level backpressure. Larger socket buffers absorb short
+	// scheduler/Yamux stalls instead of dropping QUIC/voice packets immediately.
+	// Linux may clamp these to net.core.{r,w}mem_max; the installer raises those
+	// ceilings on bare-metal/systemd deployments. Errors are harmless on platforms
+	// that do not allow changing the buffers.
+	_ = relay.SetReadBuffer(udpSocketBufferBytes)
+	_ = relay.SetWriteBuffer(udpSocketBufferBytes)
 
 	stream, err := hubManager.GetStreamUDP(nodeAlias)
 	if err != nil {
@@ -60,6 +69,20 @@ func relayUDP(ctrlConn net.Conn, relay *net.UDPConn, stream net.Conn) {
 		data []byte
 	}
 	sendCh := make(chan dgram, udpQueueDepth)
+	var queuedBytes atomic.Int64
+
+	reserveQueueBytes := func(n int) bool {
+		want := int64(n)
+		for {
+			cur := queuedBytes.Load()
+			if cur+want > udpQueueMaxBytes {
+				return false
+			}
+			if queuedBytes.CompareAndSwap(cur, cur+want) {
+				return true
+			}
+		}
+	}
 
 	// Writer: single writer to the multiplexed stream.
 	go func() {
@@ -69,6 +92,7 @@ func relayUDP(ctrlConn net.Conn, relay *net.UDPConn, stream net.Conn) {
 			case <-done:
 				return
 			case d := <-sendCh:
+				queuedBytes.Add(-int64(len(d.data)))
 				if err := tunproto.WriteDatagram(stream, d.addr, d.data); err != nil {
 					return
 				}
@@ -76,7 +100,10 @@ func relayUDP(ctrlConn net.Conn, relay *net.UDPConn, stream net.Conn) {
 		}
 	}()
 
-	// A. Client -> tunnel, drop-on-congestion.
+	// A. Client -> tunnel. We retain drop-on-overload semantics (UDP cannot push
+	// back to the sender) but tolerate substantially larger short bursts while
+	// bounding memory by BYTES, not just packet count. A malicious client therefore
+	// cannot queue thousands of 64 KiB datagrams and explode RAM.
 	go func() {
 		defer closeAll()
 		buf := make([]byte, udpBufSize)
@@ -90,12 +117,17 @@ func relayUDP(ctrlConn net.Conn, relay *net.UDPConn, stream net.Conn) {
 			if err != nil {
 				continue
 			}
-			data := make([]byte, n-off)
+			dataLen := n - off
+			if !reserveQueueBytes(dataLen) {
+				continue
+			}
+			data := make([]byte, dataLen)
 			copy(data, buf[off:n])
 			select {
 			case sendCh <- dgram{addr: addr, data: data}:
 			default:
-				// Tunnel backed up: preserve bounded memory and UDP latency.
+				queuedBytes.Add(-int64(dataLen))
+				// Count ceiling reached despite remaining byte budget: drop tail.
 			}
 		}
 	}()

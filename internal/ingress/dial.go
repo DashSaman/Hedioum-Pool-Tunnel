@@ -216,16 +216,16 @@ type dialResult struct {
 	err     error
 }
 
-// dial performs a REAL staggered race across candidate endpoints. The first fully
-// authenticated Yamux session wins. Losing successful sessions are closed, and
-// failed endpoints update cooldown memory.
+// dial performs a REAL staggered race across candidate endpoints. The result
+// channel is intentionally unbuffered: once the winner closes done, any other
+// successful racer can no longer enqueue an orphan session and instead closes it.
 func (d *endpointDialer) dial() (*yamux.Session, string, error) {
 	attempts := d.attemptOrder()
 	if len(attempts) == 0 {
 		return nil, "", fmt.Errorf("node %q has no endpoints to dial", d.node.Alias)
 	}
 
-	results := make(chan dialResult, len(attempts))
+	results := make(chan dialResult)
 	done := make(chan struct{})
 
 	for i, ep := range attempts {

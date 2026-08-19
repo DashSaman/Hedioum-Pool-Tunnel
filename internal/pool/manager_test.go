@@ -22,12 +22,16 @@ func fakeDialer() (*yamux.Session, string, error) {
 			s.Close()
 			return
 		}
+		defer srv.Close()
 		for {
 			st, err := srv.AcceptStream()
 			if err != nil {
 				return
 			}
-			go io.Copy(io.Discard, st)
+			go func() {
+				defer st.Close()
+				_, _ = io.Copy(io.Discard, st)
+			}()
 		}
 	}()
 	sess, err := yamux.Client(c, yamux.DefaultConfig())
@@ -36,6 +40,7 @@ func fakeDialer() (*yamux.Session, string, error) {
 
 func TestSubPoolsTCPandUDP(t *testing.T) {
 	hm := NewHubManager()
+	defer hm.Close()
 	cfg := config.ForeignNode{
 		Alias:               "n1",
 		TargetIP:            "1.2.3.4",
@@ -72,5 +77,37 @@ func TestSubPoolsTCPandUDP(t *testing.T) {
 
 	if _, err := hm.GetStreamTCP("unknown"); err == nil {
 		t.Fatal("expected an error for an unknown node")
+	}
+}
+
+func TestAtomicMaxInt32(t *testing.T) {
+	var v int32
+	atomicMaxInt32(&v, 3)
+	atomicMaxInt32(&v, 2)
+	atomicMaxInt32(&v, 7)
+	if v != 7 {
+		t.Fatalf("max=%d want 7", v)
+	}
+}
+
+func TestCompactClosedLocked(t *testing.T) {
+	np := &NodePool{}
+	for i := 0; i < 2; i++ {
+		sess, _, err := fakeDialer()
+		if err != nil {
+			t.Fatalf("fakeDialer: %v", err)
+		}
+		np.sessions = append(np.sessions, NewYamuxSession(sess, 10, 0, "ssh", NewLifecyclePolicy("compact")))
+	}
+	defer func() {
+		for _, s := range np.sessions {
+			_ = s.Close()
+		}
+	}()
+
+	_ = np.sessions[0].Close()
+	np.compactClosedLocked()
+	if got := len(np.sessions); got != 1 {
+		t.Fatalf("compact len=%d want 1", got)
 	}
 }

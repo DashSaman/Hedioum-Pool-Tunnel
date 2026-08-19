@@ -1,13 +1,14 @@
 package ingress
 
 import (
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"time"
 
 	"github.com/hedioum/Hedioum-Pool-Tunnel/config"
+	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/pipe"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/pool"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/sysutil"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/tundev"
@@ -27,26 +28,21 @@ func StartIranHub(cfg *config.AppConfig) {
 		dialer := newEndpointDialer(nodeCopy)
 		hubManager.RegisterNode(nodeCopy, dialer.dial)
 
-		// Local SOCKS5 listener, strictly bound to localhost, for X-UI/Xray.
 		go startLocalSocksListener(nodeCopy, hubManager)
 	}
 
-	// Bring up an OS-level TUN interface for every node that opted in. TUN mirrors
-	// the per-node SOCKS port: each enabled node gets its own interface + /24 and
-	// routes into that node's exit. Failure to start one TUN is non-fatal — SOCKS
-	// stays fully available (graceful fallback on non-Linux hosts too).
+	// Bring up an OS-level TUN interface for every node that opted in.
 	tunInstances := startTunInterfaces(cfg.ForeignNodes)
 
 	if len(cfg.ForeignNodes) == 0 {
 		slog.Warn("iran hub started with no foreign nodes; add a node and restart")
 	}
 
-	// Block until terminated. Not a bare select{}: with zero nodes there are no
-	// other goroutines, and select{} would trip the runtime's deadlock detector
-	// and crash-loop the service.
 	sysutil.WaitForTerminationSignal()
 
-	// Tear the TUN interfaces down cleanly on shutdown so a restart can re-open them.
+	// Stop the pool watchdogs/dials first so shutdown cannot create fresh sockets
+	// while TUN interfaces are being removed.
+	hubManager.Close()
 	for _, inst := range tunInstances {
 		_ = inst.Close()
 	}
@@ -58,7 +54,6 @@ func StartIranHub(cfg *config.AppConfig) {
 func startTunInterfaces(nodes []config.ForeignNode) []*tundev.Instance {
 	var instances []*tundev.Instance
 	for _, node := range nodes {
-		// Gateway mode implies a TUN, so bring the interface up for either.
 		if !node.TunEnabled && !node.GatewayEnabled {
 			continue
 		}
@@ -103,6 +98,7 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 		slog.Error("failed to bind SOCKS5 listener", "node", node.Alias, "addr", listenAddr, "err", err)
 		return
 	}
+	defer listener.Close()
 
 	if bind != "127.0.0.1" && bind != "localhost" && bind != "::1" {
 		slog.Warn("SOCKS5 bound to a non-loopback address — ensure this network is trusted (open proxy risk)",
@@ -113,9 +109,15 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			continue // Silently ignore transient socket accept errors
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Accept can fail repeatedly under FD/memory pressure. A small backoff
+			// prevents a resource-exhaustion condition from turning into a 100% CPU spin.
+			slog.Warn("SOCKS5 accept failed; retrying", "node", node.Alias, "err", err)
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-
 		go handleClientTraffic(clientConn, node.Alias, hubManager)
 	}
 }
@@ -125,21 +127,14 @@ func startLocalSocksListener(node config.ForeignNode, hubManager *pool.HubManage
 func handleClientTraffic(localConn net.Conn, nodeAlias string, hubManager *pool.HubManager) {
 	defer localConn.Close()
 
-	// 1. Negotiate SOCKS5 and read the request (command + destination).
 	cmd, dst, err := readSocksRequest(localConn)
 	if err != nil {
-		// Drop bad requests/scanners to conserve CPU and RAM.
 		slog.Debug("socks handshake failed", "node", nodeAlias, "err", err)
 		return
 	}
 
 	switch cmd {
 	case cmdConnect:
-		// Reply success (BND 0.0.0.0:0) and pipe the TCP stream.
-		if err := sendSocksReply(localConn, repSuccess, net.IPv4zero, 0); err != nil {
-			return
-		}
-		_ = localConn.SetDeadline(time.Time{}) // drop the handshake deadline for the tunnel
 		handleTCPConnect(localConn, dst, nodeAlias, hubManager)
 	case cmdUDPAssociate:
 		handleUDPAssociate(localConn, nodeAlias, hubManager)
@@ -151,30 +146,26 @@ func handleClientTraffic(localConn net.Conn, nodeAlias string, hubManager *pool.
 
 // handleTCPConnect multiplexes a SOCKS5 CONNECT over a Yamux stream to the egress.
 func handleTCPConnect(localConn net.Conn, targetDest, nodeAlias string, hubManager *pool.HubManager) {
-	// Request a multiplexed logical stream from the TCP sub-pool.
 	stream, err := hubManager.GetStreamTCP(nodeAlias)
 	if err != nil {
-		// Pool temporarily exhausted or dead: drop; X-UI/Xray core retries.
-		slog.Debug("tcp pool unavailable, dropping connection", "node", nodeAlias, "err", err)
+		_ = sendSocksReply(localConn, repGeneralFailure, net.IPv4zero, 0)
+		slog.Debug("tcp pool unavailable", "node", nodeAlias, "err", err)
 		return
 	}
 	defer stream.Close()
 
-	// Announce the stream as a TCP CONNECT and inject the target address:
-	// [StreamTCP][u16 len][target]
+	// Announce the stream before telling the SOCKS client that the tunnel path is
+	// ready. This avoids returning REP=success when the local pool itself is dead.
 	if err := tunproto.WriteTCPHeader(stream, targetDest); err != nil {
+		_ = sendSocksReply(localConn, repGeneralFailure, net.IPv4zero, 0)
 		return
 	}
+	if err := sendSocksReply(localConn, repSuccess, net.IPv4zero, 0); err != nil {
+		return
+	}
+	_ = localConn.SetDeadline(time.Time{})
 
-	// Full-duplex pipe between the local X-UI connection and the Yamux stream.
-	errChan := make(chan error, 2)
-	go func() {
-		_, err := io.Copy(stream, localConn)
-		errChan <- err
-	}()
-	go func() {
-		_, err := io.Copy(localConn, stream)
-		errChan <- err
-	}()
-	<-errChan
+	// Wait for both directions and propagate FIN independently. Returning after the
+	// first io.Copy used to truncate the still-active half of some connections.
+	_ = pipe.Bidirectional(localConn, stream)
 }

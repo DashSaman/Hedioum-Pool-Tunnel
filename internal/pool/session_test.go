@@ -1,12 +1,10 @@
 package pool
 
 import (
-	"context"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/time/rate"
 )
 
 // fakeConn is a no-op net.Conn for exercising monitoredStream in isolation.
@@ -21,45 +19,59 @@ func (fakeConn) SetDeadline(time.Time) error      { return nil }
 func (fakeConn) SetReadDeadline(time.Time) error  { return nil }
 func (fakeConn) SetWriteDeadline(time.Time) error { return nil }
 
-// TestMonitoredStreamCloseUnblocksRateLimit verifies that closing a stream
-// cancels its context so a goroutine parked in the token-bucket WaitN returns
-// promptly instead of waiting out the full delay (no goroutine leak on a dead
-// connection).
-func TestMonitoredStreamCloseUnblocksRateLimit(t *testing.T) {
-	// 1 byte/sec with a 4-byte burst; drain the burst so any further wait is slow.
-	ys := &YamuxSession{limiter: rate.NewLimiter(1, 4)}
-	ys.limiter.AllowN(time.Now(), 4)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	ms := &monitoredStream{Conn: fakeConn{}, parent: ys, ctx: ctx, cancel: cancel}
+// TestMonitoredStreamDoesNotThrottle verifies the performance fork's key invariant:
+// the hot payload path accounts bytes but does not sleep/rate-limit the flow.
+func TestMonitoredStreamDoesNotThrottle(t *testing.T) {
+	ys := &YamuxSession{}
+	ms := &monitoredStream{Conn: fakeConn{}, parent: ys}
+	payload := make([]byte, 8*1024*1024)
 
 	start := time.Now()
-	if err := ms.Close(); err != nil { // cancels ctx
-		t.Fatalf("close: %v", err)
-	}
-	if _, err := ms.Write([]byte("payload-larger-than-burst")); err != nil {
+	n, err := ms.Write(payload)
+	if err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("Write blocked %v despite a canceled context", elapsed)
+	if n != len(payload) {
+		t.Fatalf("write=%d, want %d", n, len(payload))
 	}
-
-	select {
-	case <-ms.ctx.Done():
-	default:
-		t.Fatal("Close did not cancel the stream context")
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("payload path unexpectedly stalled for %v", elapsed)
+	}
+	if got := atomic.LoadUint64(&ys.bytesTransferred); got != uint64(len(payload)) {
+		t.Fatalf("bytesTransferred=%d, want %d", got, len(payload))
 	}
 }
 
-// TestChaosLimitBounds verifies the fluctuating DPI-evasion cap: with no jitter it
-// equals the base, with jitter it stays within [base-jitter, base+jitter], and it
-// never falls below 1 Mbps even when jitter exceeds the base.
+// TestPayloadIORefreshesActivity locks the stability fix for long-lived low-rate
+// streams: actual I/O, not stream creation time, defines idleness.
+func TestPayloadIORefreshesActivity(t *testing.T) {
+	ys := &YamuxSession{}
+	atomic.StoreInt64(&ys.lastActivityUnixNano, time.Now().Add(-5*time.Minute).UnixNano())
+	ms := &monitoredStream{Conn: fakeConn{}, parent: ys}
+
+	if _, err := ms.Write([]byte("keepalive")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if idle := ys.IdleTime(); idle > time.Second {
+		t.Fatalf("live stream still looks idle: %v", idle)
+	}
+}
+
+// TestChaosLimitBounds verifies the fluctuating scale-out target, including
+// defensive handling of malformed negative jitter from a legacy/manual config.
 func TestChaosLimitBounds(t *testing.T) {
 	// No jitter -> exact base.
 	s := &YamuxSession{baseLimitMbps: 20, jitterMbps: 0}
 	s.UpdateChaosLimit()
 	if got := s.CurrentCap(); got != 20 {
 		t.Fatalf("no-jitter cap = %d, want 20", got)
+	}
+
+	// Negative jitter is treated as disabled and must never panic rand.Intn.
+	s = &YamuxSession{baseLimitMbps: 20, jitterMbps: -5}
+	s.UpdateChaosLimit()
+	if got := s.CurrentCap(); got != 20 {
+		t.Fatalf("negative-jitter cap = %d, want 20", got)
 	}
 
 	// With jitter -> always within band, over many draws.

@@ -12,8 +12,13 @@ import (
 const (
 	StreamWindow = 16 << 20 // 16 MiB: high-RTT bandwidth-delay-product headroom
 	AcceptBacklog = 1024
-	OpenTimeout = 20 * time.Second
-	WriteTimeout = 30 * time.Second
+	// Opening a stream is a control RTT over an already-established physical pipe;
+	// several seconds is generous even on high-latency WANs and avoids a zombie
+	// session stalling one client request for Yamux's much longer default timeout.
+	OpenTimeout = 5 * time.Second
+	// A local socket write blocked for 10s indicates a badly wedged physical pipe;
+	// fail it so the pool can move traffic to another session.
+	WriteTimeout = 10 * time.Second
 	CloseTimeout = 5 * time.Minute
 )
 

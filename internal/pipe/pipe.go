@@ -26,31 +26,39 @@ func halfCloseWrite(c net.Conn) {
 	}
 }
 
-// Bidirectional copies both directions and waits for BOTH pumps to finish. Waiting
-// for just the first io.Copy and then deferring Close can truncate a response after
-// the request side reaches EOF (or vice versa). Each completed direction is
-// half-closed so protocols that rely on EOF still progress cleanly.
+type copyResult struct {
+	err error
+}
+
+// Bidirectional copies both directions and waits for BOTH pumps to finish on a
+// graceful EOF. A clean EOF half-closes only that write direction so the peer can
+// still finish its response. A real copy error is different: both conns are closed
+// immediately to unblock the opposite goroutine and avoid a permanent goroutine/
+// stream leak on a broken transport.
 func Bidirectional(a, b net.Conn) error {
-	errCh := make(chan error, 2)
+	resCh := make(chan copyResult, 2)
 
-	go func() {
-		_, err := io.Copy(b, a)
-		halfCloseWrite(b)
-		errCh <- err
-	}()
-	go func() {
-		_, err := io.Copy(a, b)
-		halfCloseWrite(a)
-		errCh <- err
-	}()
-
-	err1 := <-errCh
-	err2 := <-errCh
-	if err1 != nil && !errors.Is(err1, net.ErrClosed) {
-		return err1
+	pump := func(dst, src net.Conn) {
+		_, err := io.Copy(dst, src)
+		if err == nil {
+			halfCloseWrite(dst)
+		} else {
+			_ = a.Close()
+			_ = b.Close()
+		}
+		resCh <- copyResult{err: err}
 	}
-	if err2 != nil && !errors.Is(err2, net.ErrClosed) {
-		return err2
+
+	go pump(b, a)
+	go pump(a, b)
+
+	r1 := <-resCh
+	r2 := <-resCh
+	if r1.err != nil && !errors.Is(r1.err, net.ErrClosed) {
+		return r1.err
+	}
+	if r2.err != nil && !errors.Is(r2.err, net.ErrClosed) {
+		return r2.err
 	}
 	return nil
 }

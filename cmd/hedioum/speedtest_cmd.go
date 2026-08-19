@@ -7,14 +7,15 @@ import (
 	mrand "math/rand/v2"
 	"time"
 
-	"github.com/hashicorp/yamux"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/config"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/ingress"
+	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/muxcfg"
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/tunproto"
 )
 
-// cmdSpeedtest measures raw tunnel throughput to a foreign node, bypassing the
-// shaper. It opens its own connection (a mini-hub), independent of the daemon.
+// cmdSpeedtest measures raw tunnel throughput to a foreign node, bypassing all
+// pool heuristics. It opens its own connection with the same production Yamux WAN
+// profile so the result reflects the real transport rather than a smaller test window.
 func cmdSpeedtest(args []string) {
 	fs := flag.NewFlagSet("speedtest", flag.ExitOnError)
 	nodeAlias := fs.String("node", "", "node alias (default: first)")
@@ -77,9 +78,11 @@ func report(label string, mbps float64, err error) {
 }
 
 func runSpeedtest(ep config.Endpoint, token string, direction byte, seconds int) (float64, error) {
-	yc := yamux.DefaultConfig()
-	yc.MaxStreamWindowSize = 16 << 20
-	sess, err := ingress.DialEndpoint(ep, token, yc)
+	if seconds < 1 || seconds > 300 {
+		return 0, fmt.Errorf("seconds must be between 1 and 300")
+	}
+
+	sess, err := ingress.DialEndpoint(ep, token, muxcfg.WAN())
 	if err != nil {
 		return 0, err
 	}
@@ -104,7 +107,7 @@ func runSpeedtest(ep config.Endpoint, token string, direction byte, seconds int)
 			n, e := stream.Read(buf)
 			total += int64(n)
 			if e != nil {
-				break // egress closed the stream at its deadline
+				break
 			}
 		}
 	case tunproto.SpeedUp:
@@ -119,6 +122,8 @@ func runSpeedtest(ep config.Endpoint, token string, direction byte, seconds int)
 				break
 			}
 		}
+	default:
+		return 0, fmt.Errorf("unknown speedtest direction %d", direction)
 	}
 	elapsed := time.Since(start).Seconds()
 	if elapsed <= 0 {

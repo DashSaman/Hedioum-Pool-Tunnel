@@ -20,35 +20,68 @@ const (
 // in tests to reach a loopback echo server without tripping the SSRF gate.
 var dialUDP = safeDialUDP
 
-// udpFlow is one connected UDP socket to a single target. Timer operations and
-// close state are synchronized because request and response goroutines both touch
-// the idle deadline.
+// udpFlow is one connected UDP socket to a single target. Timer operations,
+// activity and close state are synchronized because request, response and timeout
+// goroutines all touch the same flow.
 type udpFlow struct {
 	conn   *net.UDPConn
 	target tunproto.Addr
 
-	timerMu sync.Mutex
-	timer   *time.Timer
-	closed  bool
+	timerMu      sync.Mutex
+	timer        *time.Timer
+	lastActivity time.Time
+	closed       bool
 }
 
+// arm installs an idle timer that re-checks the actual last-activity timestamp
+// when it fires. This prevents a stale timer callback from closing a flow that was
+// refreshed at almost exactly the timeout boundary.
 func (f *udpFlow) arm(onIdle func()) {
 	f.timerMu.Lock()
 	defer f.timerMu.Unlock()
 	if f.closed {
 		return
 	}
-	if f.timer == nil {
-		f.timer = time.AfterFunc(udpIdleTimeout, onIdle)
-		return
+	f.lastActivity = time.Now()
+
+	var expire func()
+	expire = func() {
+		f.timerMu.Lock()
+		if f.closed {
+			f.timerMu.Unlock()
+			return
+		}
+		idleFor := time.Since(f.lastActivity)
+		if idleFor < udpIdleTimeout {
+			remaining := udpIdleTimeout - idleFor
+			f.timer.Reset(remaining)
+			f.timerMu.Unlock()
+			return
+		}
+
+		// Win the timeout race while holding timerMu: after closed=true, a
+		// concurrent touch cannot revive this expired socket. Close the fd here,
+		// then let onIdle remove this exact identity from the flow map.
+		f.closed = true
+		conn := f.conn
+		f.timerMu.Unlock()
+		if conn != nil {
+			_ = conn.Close()
+		}
+		onIdle()
 	}
-	f.timer.Reset(udpIdleTimeout)
+
+	f.timer = time.AfterFunc(udpIdleTimeout, expire)
 }
 
 func (f *udpFlow) touch() {
 	f.timerMu.Lock()
 	defer f.timerMu.Unlock()
-	if !f.closed && f.timer != nil {
+	if f.closed {
+		return
+	}
+	f.lastActivity = time.Now()
+	if f.timer != nil {
 		f.timer.Reset(udpIdleTimeout)
 	}
 }
@@ -130,8 +163,7 @@ func handleUDPStream(stream net.Conn) {
 			flows[key] = f
 
 			// Capture explicit immutable copies for the delayed timer callback. This
-			// avoids any dependence on loop-variable capture semantics and guarantees
-			// an old timer can target only the flow instance that created it.
+			// guarantees an old callback can target only the flow instance that made it.
 			flowKey, flowPtr := key, f
 			f.arm(func() { closeFlow(flowKey, flowPtr) })
 			go udpResponseReader(f, key, stream, &streamWriteMu, closeFlow)

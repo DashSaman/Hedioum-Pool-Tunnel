@@ -20,39 +20,88 @@ const (
 // in tests to reach a loopback echo server without tripping the SSRF gate.
 var dialUDP = safeDialUDP
 
-// udpFlow is one connected UDP socket to a single target, with an idle timer.
+// udpFlow is one connected UDP socket to a single target. Timer operations and
+// close state are synchronized because request and response goroutines both touch
+// the idle deadline.
 type udpFlow struct {
 	conn   *net.UDPConn
-	target tunproto.Addr // echoed back as the source of responses
-	timer  *time.Timer
+	target tunproto.Addr
+
+	timerMu sync.Mutex
+	timer   *time.Timer
+	closed  bool
 }
 
-// handleUDPStream relays a UDP association's datagrams to the internet. It keeps a
-// per-stream NAT table of connected UDP sockets (one per target) with idle
-// timeouts, bounds the table size, and applies the same SSRF gate as TCP to every
-// target. Responses are written back on the stream as tunproto datagrams.
+func (f *udpFlow) arm(onIdle func()) {
+	f.timerMu.Lock()
+	defer f.timerMu.Unlock()
+	if f.closed {
+		return
+	}
+	if f.timer == nil {
+		f.timer = time.AfterFunc(udpIdleTimeout, onIdle)
+		return
+	}
+	f.timer.Reset(udpIdleTimeout)
+}
+
+func (f *udpFlow) touch() {
+	f.timerMu.Lock()
+	defer f.timerMu.Unlock()
+	if !f.closed && f.timer != nil {
+		f.timer.Reset(udpIdleTimeout)
+	}
+}
+
+func (f *udpFlow) close() {
+	f.timerMu.Lock()
+	if f.closed {
+		f.timerMu.Unlock()
+		return
+	}
+	f.closed = true
+	if f.timer != nil {
+		f.timer.Stop()
+	}
+	conn := f.conn
+	f.timerMu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+// handleUDPStream relays a UDP association's datagrams to the internet. The flow
+// table is identity-safe: an old timer/reader may close only the exact udpFlow it
+// belongs to, never a newer flow that reused the same host:port key.
 func handleUDPStream(stream net.Conn) {
 	var mu sync.Mutex
 	flows := make(map[string]*udpFlow)
-	var streamWriteMu sync.Mutex // multiple flow readers write back to one stream
+	var streamWriteMu sync.Mutex
 
-	closeFlow := func(key string) {
+	closeFlow := func(key string, expected *udpFlow) {
+		var victim *udpFlow
 		mu.Lock()
-		if f, ok := flows[key]; ok {
+		if current, ok := flows[key]; ok && current == expected {
 			delete(flows, key)
-			f.timer.Stop()
-			f.conn.Close()
+			victim = current
 		}
 		mu.Unlock()
+		if victim != nil {
+			victim.close()
+		}
 	}
 
 	defer func() {
 		mu.Lock()
-		for _, f := range flows {
-			f.timer.Stop()
-			f.conn.Close()
+		victims := make([]*udpFlow, 0, len(flows))
+		for key, f := range flows {
+			delete(flows, key)
+			victims = append(victims, f)
 		}
 		mu.Unlock()
+		for _, f := range victims {
+			f.close()
+		}
 	}()
 
 	for {
@@ -67,7 +116,7 @@ func handleUDPStream(stream net.Conn) {
 		if !ok {
 			if len(flows) >= udpMaxFlows {
 				mu.Unlock()
-				continue // table full: drop
+				continue
 			}
 			uconn, derr := dialUDP(key)
 			if derr != nil {
@@ -78,30 +127,36 @@ func handleUDPStream(stream net.Conn) {
 				continue
 			}
 			f = &udpFlow{conn: uconn, target: addr}
-			f.timer = time.AfterFunc(udpIdleTimeout, func() { closeFlow(key) })
 			flows[key] = f
+			f.arm(func() { closeFlow(key, f) })
 			go udpResponseReader(f, key, stream, &streamWriteMu, closeFlow)
 		}
 		mu.Unlock()
 
-		f.timer.Reset(udpIdleTimeout)
+		f.touch()
 		if _, werr := f.conn.Write(payload); werr != nil {
-			closeFlow(key)
+			closeFlow(key, f)
 		}
 	}
 }
 
 // udpResponseReader reads datagrams coming back from the target and writes them to
-// the tunnel stream (source = the target address), until the socket closes.
-func udpResponseReader(f *udpFlow, key string, stream net.Conn, streamWriteMu *sync.Mutex, closeFlow func(string)) {
-	defer closeFlow(key)
+// the tunnel stream, until the exact flow socket closes.
+func udpResponseReader(
+	f *udpFlow,
+	key string,
+	stream net.Conn,
+	streamWriteMu *sync.Mutex,
+	closeFlow func(string, *udpFlow),
+) {
+	defer closeFlow(key, f)
 	buf := make([]byte, udpReadBufSize)
 	for {
 		n, err := f.conn.Read(buf)
 		if err != nil {
 			return
 		}
-		f.timer.Reset(udpIdleTimeout)
+		f.touch()
 		streamWriteMu.Lock()
 		werr := tunproto.WriteDatagram(stream, f.target, buf[:n])
 		streamWriteMu.Unlock()

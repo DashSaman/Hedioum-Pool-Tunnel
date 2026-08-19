@@ -145,6 +145,14 @@ func (ys *YamuxSession) GetAndResetBytes() uint64 {
 	return atomic.SwapUint64(&ys.bytesTransferred, 0)
 }
 
+// RecentBytes returns the bytes seen in the current health interval without
+// resetting the counter. Stream placement uses this only as a tie-breaker after
+// logical-stream count, so a heavy bulk flow is less likely to receive another
+// user flow when an equally populated but quieter physical pipe is available.
+func (ys *YamuxSession) RecentBytes() uint64 {
+	return atomic.LoadUint64(&ys.bytesTransferred)
+}
+
 // UpdateChaosLimit shifts the per-pipe scale-out target randomly. Unlike upstream,
 // it does not install a hard rate limiter; this preserves the distribution signal
 // used by the pool without artificially capping a user's flow. Negative jitter is

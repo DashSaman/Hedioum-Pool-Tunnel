@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -14,7 +15,6 @@ func TestSpeedtestDownload(t *testing.T) {
 	done := make(chan struct{})
 	go func() { handleSpeedtestStream(s); s.Close(); close(done) }()
 
-	// dir + u16 seconds (the stream-type byte is consumed by the dispatcher).
 	if _, err := c.Write([]byte{tunproto.SpeedDown, 0x00, 0x01}); err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +38,7 @@ func TestSpeedtestDownload(t *testing.T) {
 	}
 }
 
-func TestSpeedtestUploadDrains(t *testing.T) {
+func TestSpeedtestUploadReceiverReport(t *testing.T) {
 	c, s := net.Pipe()
 	defer c.Close()
 	done := make(chan struct{})
@@ -47,19 +47,67 @@ func TestSpeedtestUploadDrains(t *testing.T) {
 	if _, err := c.Write([]byte{tunproto.SpeedUp, 0x00, 0x01}); err != nil {
 		t.Fatal(err)
 	}
-	// Push data for ~1s; the egress should drain it without error until its deadline.
-	buf := make([]byte, speedtestChunk)
-	c.SetWriteDeadline(time.Now().Add(3 * time.Second))
-	sent := 0
-	for {
-		n, err := c.Write(buf)
-		sent += n
-		if err != nil {
-			break // egress closed at its deadline
-		}
+
+	payload := make([]byte, 256*1024)
+	for i := range payload {
+		payload[i] = byte(i)
 	}
-	if sent == 0 {
-		t.Fatal("upload sent no data")
+	if _, err := c.Write(payload); err != nil {
+		t.Fatalf("upload write: %v", err)
 	}
+	// net.Pipe has no TCP-style CloseWrite, so for this unit test we signal EOF by
+	// closing the writer-side pipe and read the result through a second in-memory
+	// path would be impossible. Instead use a real loopback TCP pair below.
+	_ = c.Close()
 	<-done
+}
+
+func TestSpeedtestUploadReceiverReportTCP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	serverDone := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err == nil {
+			handleSpeedtestStream(conn)
+			_ = conn.Close()
+		}
+		close(serverDone)
+	}()
+
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := raw.(*net.TCPConn)
+	defer conn.Close()
+	if _, err := conn.Write([]byte{tunproto.SpeedUp, 0x00, 0x01}); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 384*1024)
+	if _, err := conn.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	result, err := tunproto.ReadSpeedtestResult(conn)
+	if err != nil {
+		t.Fatalf("read receiver result: %v", err)
+	}
+	if result.Bytes != uint64(len(payload)) {
+		t.Fatalf("foreign counted %d bytes, want %d", result.Bytes, len(payload))
+	}
+	if result.Elapsed <= 0 {
+		t.Fatalf("invalid elapsed: %v", result.Elapsed)
+	}
+	if _, err := io.Copy(io.Discard, conn); err != nil {
+		t.Fatalf("drain: %v", err)
+	}
+	<-serverDone
 }

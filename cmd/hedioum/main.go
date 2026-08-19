@@ -20,11 +20,12 @@ import (
 // AppVersion defines the current build version for the self-updater.
 // It matches the fork release tag produced by .github/workflows/fork-release.yml.
 //
-// v0.11.1-pv1 is the DashSaman stability/throughput hardening fork based on
-// upstream v0.11.0: unthrottled hot data path, symmetric high-RTT Yamux windows,
-// non-blocking pool recovery, lossless TCP half-close, real endpoint racing, and
-// hardened UDP flow lifecycle/timer handling. Wire framing remains compatible.
-const AppVersion = "v0.11.1-pv1"
+// v0.11.2-pv1 is the deep data-plane hardening release: receiver-verified
+// directional speed tests, symmetric high-BDP host tuning, safer WAN timeouts,
+// make-before-break lifecycle churn, reservation-aware pipe balancing, bounded
+// recovery/UDP/DNS resources and reduced high-rate GC pressure. Wire framing for
+// normal TCP/UDP user traffic remains compatible with the previous fork release.
+const AppVersion = "v0.11.2-pv1"
 
 func main() {
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {

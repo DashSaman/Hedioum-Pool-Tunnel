@@ -57,15 +57,21 @@ func TestPayloadIORefreshesActivity(t *testing.T) {
 	}
 }
 
-// TestChaosLimitBounds verifies the fluctuating scale-out target: with no jitter it
-// equals the base, with jitter it stays within [base-jitter, base+jitter], and it
-// never falls below 1 Mbps even when jitter exceeds the base.
+// TestChaosLimitBounds verifies the fluctuating scale-out target, including
+// defensive handling of malformed negative jitter from a legacy/manual config.
 func TestChaosLimitBounds(t *testing.T) {
 	// No jitter -> exact base.
 	s := &YamuxSession{baseLimitMbps: 20, jitterMbps: 0}
 	s.UpdateChaosLimit()
 	if got := s.CurrentCap(); got != 20 {
 		t.Fatalf("no-jitter cap = %d, want 20", got)
+	}
+
+	// Negative jitter is treated as disabled and must never panic rand.Intn.
+	s = &YamuxSession{baseLimitMbps: 20, jitterMbps: -5}
+	s.UpdateChaosLimit()
+	if got := s.CurrentCap(); got != 20 {
+		t.Fatalf("negative-jitter cap = %d, want 20", got)
 	}
 
 	// With jitter -> always within band, over many draws.

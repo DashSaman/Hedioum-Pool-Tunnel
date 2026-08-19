@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	mrand "math/rand/v2"
 	"time"
 
@@ -13,9 +15,9 @@ import (
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/tunproto"
 )
 
-// cmdSpeedtest measures raw tunnel throughput to a foreign node, bypassing all
-// pool heuristics. It opens its own connection with the same production Yamux WAN
-// profile so the result reflects the real transport rather than a smaller test window.
+// cmdSpeedtest measures raw tunnel throughput to a foreign node, bypassing pool
+// heuristics and using the exact production Yamux WAN profile. Both directions are
+// receiver-measured: the hub counts download bytes, the foreign counts upload bytes.
 func cmdSpeedtest(args []string) {
 	fs := flag.NewFlagSet("speedtest", flag.ExitOnError)
 	nodeAlias := fs.String("node", "", "node alias (default: first)")
@@ -43,6 +45,9 @@ func cmdSpeedtest(args []string) {
 		if !found {
 			fail("node %q not found", *nodeAlias)
 		}
+	}
+	if len(node.Endpoints) == 0 {
+		fail("node %q has no endpoints", node.Alias)
 	}
 	ep := node.Endpoints[0]
 	if *mimicSel != "" {
@@ -98,36 +103,53 @@ func runSpeedtest(ep config.Endpoint, token string, direction byte, seconds int)
 	}
 
 	buf := make([]byte, 64*1024)
-	var total int64
-	start := time.Now()
 	switch direction {
 	case tunproto.SpeedDown:
-		_ = stream.SetReadDeadline(time.Now().Add(time.Duration(seconds+5) * time.Second))
+		start := time.Now()
+		_ = stream.SetReadDeadline(start.Add(time.Duration(seconds+15) * time.Second))
+		var total uint64
 		for {
-			n, e := stream.Read(buf)
-			total += int64(n)
-			if e != nil {
+			n, readErr := stream.Read(buf)
+			total += uint64(n)
+			if readErr != nil {
+				if !errors.Is(readErr, io.EOF) {
+					return 0, fmt.Errorf("download stream: %w", readErr)
+				}
 				break
 			}
 		}
+		elapsed := time.Since(start)
+		if elapsed <= 0 {
+			return 0, fmt.Errorf("no download elapsed time")
+		}
+		return float64(total) * 8 / elapsed.Seconds() / 1e6, nil
+
 	case tunproto.SpeedUp:
 		for i := 0; i+8 <= len(buf); i += 8 {
 			binary.LittleEndian.PutUint64(buf[i:], mrand.Uint64())
 		}
-		deadline := start.Add(time.Duration(seconds) * time.Second)
+		deadline := time.Now().Add(time.Duration(seconds) * time.Second)
 		for time.Now().Before(deadline) {
-			n, e := stream.Write(buf)
-			total += int64(n)
-			if e != nil {
-				break
+			if _, err := stream.Write(buf); err != nil {
+				return 0, fmt.Errorf("upload stream: %w", err)
 			}
 		}
+		// yamux.Stream.Close is a local write-side FIN while reads remain valid.
+		// This tells the foreign receiver that every uploaded byte has been sent.
+		if err := stream.Close(); err != nil {
+			return 0, fmt.Errorf("finish upload: %w", err)
+		}
+		_ = stream.SetReadDeadline(time.Now().Add(15 * time.Second))
+		result, err := tunproto.ReadSpeedtestResult(stream)
+		if err != nil {
+			return 0, fmt.Errorf("read foreign upload result: %w", err)
+		}
+		if result.Elapsed <= 0 {
+			return 0, fmt.Errorf("foreign reported zero upload elapsed time")
+		}
+		return float64(result.Bytes) * 8 / result.Elapsed.Seconds() / 1e6, nil
+
 	default:
 		return 0, fmt.Errorf("unknown speedtest direction %d", direction)
 	}
-	elapsed := time.Since(start).Seconds()
-	if elapsed <= 0 {
-		return 0, fmt.Errorf("no elapsed time")
-	}
-	return float64(total) * 8 / elapsed / 1e6, nil
 }

@@ -13,6 +13,10 @@ import (
 	utls "github.com/refraction-networking/utls"
 )
 
+// Variable (rather than const) only so regression tests can exercise stalled-auth
+// paths without sleeping 15 seconds. Production never mutates it.
+var tlsHandshakeTimeout = 15 * time.Second
+
 // TLSMimic disguises the tunnel as an HTTPS server: a real TLS handshake provides
 // the single crypto layer, and a channel-bound token auth (tlsauth.go) proves the
 // peer without sending the token and without a second encryption layer. The
@@ -34,7 +38,14 @@ type TLSMimic struct {
 }
 
 func (m *TLSMimic) Accept(conn net.Conn) (net.Conn, net.Conn, error) {
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	// IMPORTANT: the deadline covers BOTH the public TLS handshake and Hedioum's
+	// channel-bound authentication below. Clearing it immediately after TLS used to
+	// let a peer complete TLS and then stall forever before sending auth, leaking a
+	// socket/goroutine on the egress and eventually starving the pool.
+	if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+		return nil, conn, err
+	}
+	defer conn.SetDeadline(time.Time{})
 
 	// Capture the fingerprint of the leaf certificate actually served on this
 	// handshake, so the channel-bound auth binds to it (works for self-signed AND
@@ -58,7 +69,6 @@ func (m *TLSMimic) Accept(conn net.Conn) (net.Conn, net.Conn, error) {
 		// Not even a valid TLS ClientHello; nothing believable to serve.
 		return nil, conn, err
 	}
-	_ = conn.SetDeadline(time.Time{})
 
 	// Record the decrypted inner bytes so a non-client can be replayed to the decoy;
 	// read the channel-bound auth through the recorder.
@@ -121,13 +131,19 @@ type TLSClient struct {
 }
 
 func (c *TLSClient) Dial(conn net.Conn) (net.Conn, error) {
-	_ = conn.SetDeadline(time.Now().Add(15 * time.Second))
+	// Keep the timeout active through the channel-auth ACK. Previously the deadline
+	// was cleared after uTLS.Handshake, so a half-open/proxying endpoint could make a
+	// pool replenish worker wait forever after completing TLS.
+	if err := conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout)); err != nil {
+		return nil, err
+	}
+	defer conn.SetDeadline(time.Time{})
+
 	cfg := &utls.Config{ServerName: c.ServerName, InsecureSkipVerify: true}
 	uconn := utls.UClient(conn, cfg, utls.HelloChrome_Auto)
 	if err := uconn.Handshake(); err != nil {
 		return nil, fmt.Errorf("tls handshake: %w", err)
 	}
-	_ = conn.SetDeadline(time.Time{})
 
 	state := uconn.ConnectionState()
 	if len(state.PeerCertificates) == 0 {

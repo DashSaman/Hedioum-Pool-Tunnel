@@ -10,16 +10,12 @@ import (
 	"github.com/hedioum/Hedioum-Pool-Tunnel/config"
 )
 
-// fakeDialer pairs a yamux client/server over an in-memory pipe and drains any
-// streams the pool opens, standing in for a real egress. It reports "ssh" so the
-// warm-up count stays stable during the test (SSH rotates only on a multi-hour
-// schedule, so no pipe retires mid-test).
 func fakeDialer() (*yamux.Session, string, error) {
 	c, s := net.Pipe()
 	go func() {
 		srv, err := yamux.Server(s, yamux.DefaultConfig())
 		if err != nil {
-			s.Close()
+			_ = s.Close()
 			return
 		}
 		defer srv.Close()
@@ -41,42 +37,77 @@ func fakeDialer() (*yamux.Session, string, error) {
 func TestSubPoolsTCPandUDP(t *testing.T) {
 	hm := NewHubManager()
 	defer hm.Close()
-	cfg := config.ForeignNode{
-		Alias:               "n1",
-		TargetIP:            "1.2.3.4",
-		MinConnections:      1,
-		MaxConnections:      3,
-		BandwidthLimitMbps:  50,
-		BandwidthJitterMbps: 5,
-	}
+	cfg := config.ForeignNode{Alias: "n1", TargetIP: "1.2.3.4", MinConnections: 1, MaxConnections: 3, BandwidthLimitMbps: 50, BandwidthJitterMbps: 5}
 	hm.RegisterNode(cfg, fakeDialer)
-
-	// Warm-up: TCP min (1) + UDP min (udpMinConns=2) = 3 physical connections.
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if hm.GetStats("n1").ActiveConns >= 1+udpMinConns {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("pools did not warm up: %+v", hm.GetStats("n1"))
+			t.Fatalf("pools did not warm: %+v", hm.GetStats("n1"))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-
-	tcpStream, err := hm.GetStreamTCP("n1")
+	tcp, err := hm.GetStreamTCP("n1")
 	if err != nil {
-		t.Fatalf("GetStreamTCP: %v", err)
+		t.Fatal(err)
 	}
-	defer tcpStream.Close()
-
-	udpStream, err := hm.GetStreamUDP("n1")
+	defer tcp.Close()
+	udp, err := hm.GetStreamUDP("n1")
 	if err != nil {
-		t.Fatalf("GetStreamUDP: %v", err)
+		t.Fatal(err)
 	}
-	defer udpStream.Close()
-
+	defer udp.Close()
 	if _, err := hm.GetStreamTCP("unknown"); err == nil {
-		t.Fatal("expected an error for an unknown node")
+		t.Fatal("expected unknown node error")
+	}
+}
+
+func TestReservationSpreadsBurstAcrossPipes(t *testing.T) {
+	np := &NodePool{}
+	for i := 0; i < 3; i++ {
+		sess, _, err := fakeDialer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		np.sessions = append(np.sessions, NewYamuxSession(sess, 10, 0, "ssh", NewLifecyclePolicy("spread")))
+	}
+	defer func() {
+		for _, s := range np.sessions {
+			_ = s.Close()
+		}
+	}()
+	a := np.reserveLeastLoaded()
+	b := np.reserveLeastLoaded()
+	c := np.reserveLeastLoaded()
+	if a == nil || b == nil || c == nil {
+		t.Fatal("missing reservation")
+	}
+	defer a.ReleaseOpen()
+	defer b.ReleaseOpen()
+	defer c.ReleaseOpen()
+	if a == b || a == c || b == c {
+		t.Fatalf("burst reservations herded onto same pipe: %p %p %p", a, b, c)
+	}
+}
+
+func TestNormalizePoolBounds(t *testing.T) {
+	cases := []struct {
+		min, max int
+		wantMin, wantMax int
+	}{
+		{0, 0, defaultMinConns, defaultMinConns + 5},
+		{10, 20, 10, 20},
+		{20, 5, 20, 25},
+		{10000, 10000, hardMaxConns, hardMaxConns},
+		{100, 10000, 100, hardMaxConns},
+	}
+	for _, c := range cases {
+		gotMin, gotMax := normalizePoolBounds(c.min, c.max)
+		if gotMin != c.wantMin || gotMax != c.wantMax {
+			t.Fatalf("normalize(%d,%d)=(%d,%d), want (%d,%d)", c.min, c.max, gotMin, gotMax, c.wantMin, c.wantMax)
+		}
 	}
 }
 
@@ -86,7 +117,7 @@ func TestAtomicMaxInt32(t *testing.T) {
 	atomicMaxInt32(&v, 2)
 	atomicMaxInt32(&v, 7)
 	if v != 7 {
-		t.Fatalf("max=%d want 7", v)
+		t.Fatalf("max=%d", v)
 	}
 }
 
@@ -95,7 +126,7 @@ func TestCompactClosedLocked(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		sess, _, err := fakeDialer()
 		if err != nil {
-			t.Fatalf("fakeDialer: %v", err)
+			t.Fatal(err)
 		}
 		np.sessions = append(np.sessions, NewYamuxSession(sess, 10, 0, "ssh", NewLifecyclePolicy("compact")))
 	}
@@ -104,10 +135,9 @@ func TestCompactClosedLocked(t *testing.T) {
 			_ = s.Close()
 		}
 	}()
-
 	_ = np.sessions[0].Close()
 	np.compactClosedLocked()
-	if got := len(np.sessions); got != 1 {
-		t.Fatalf("compact len=%d want 1", got)
+	if len(np.sessions) != 1 {
+		t.Fatalf("len=%d", len(np.sessions))
 	}
 }

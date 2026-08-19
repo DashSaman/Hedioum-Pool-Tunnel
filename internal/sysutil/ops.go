@@ -16,16 +16,13 @@ import (
 const (
 	binaryPath = "/usr/local/bin/hedioum-tunnel"
 	backupPath = "/usr/local/bin/hedioum-tunnel.bak"
-	// stagePath is deliberately in the SAME directory as binaryPath so the final
-	// swap is an atomic same-filesystem rename (a /tmp staging area risks EXDEV).
-	stagePath = "/usr/local/bin/hedioum-tunnel.new"
-	repoAPI   = "https://api.github.com/repos/DashSaman/Hedioum-Pool-Tunnel/releases/latest"
+	stagePath  = "/usr/local/bin/hedioum-tunnel.new"
+	repoAPI    = "https://api.github.com/repos/DashSaman/Hedioum-Pool-Tunnel/releases/latest"
 
-	minBinarySize    = 1024 * 1024 // sanity floor for a real binary
+	minBinarySize    = 1024 * 1024
 	downloadAttempts = 3
 )
 
-// GitHubRelease represents the structure of the GitHub API response
 type GitHubRelease struct {
 	TagName string `json:"tag_name"`
 	Assets  []struct {
@@ -34,10 +31,6 @@ type GitHubRelease struct {
 	} `json:"assets"`
 }
 
-// SelfUpdate downloads and installs a newer release from GitHub, with retries,
-// a semver "is-newer" check, and automatic rollback. When GitHub is unreachable
-// (e.g. filtered) it prints the manual path: download the binary and run
-// `hedioum-tunnel update --file /path`.
 func SelfUpdate(currentVersion string) {
 	color.Cyan("[*] Checking for updates...")
 
@@ -69,8 +62,6 @@ func SelfUpdate(currentVersion string) {
 	installStaged(release.TagName)
 }
 
-// UpdateFromFile installs a locally-provided binary (the manual fallback when
-// GitHub is blocked), using the same backup/rollback flow.
 func UpdateFromFile(path string) {
 	color.Cyan("[*] Installing from %s ...", path)
 	if err := copyFile(path, stagePath); err != nil {
@@ -81,7 +72,6 @@ func UpdateFromFile(path string) {
 	installStaged("manual:" + path)
 }
 
-// fetchLatestRelease queries this fork's GitHub releases API.
 func fetchLatestRelease() (*GitHubRelease, error) {
 	client := http.Client{Timeout: 8 * time.Second}
 	resp, err := client.Get(repoAPI)
@@ -118,8 +108,6 @@ func assetURL(release *GitHubRelease, name string) string {
 	return ""
 }
 
-// downloadWithRetry downloads url to dst directly from GitHub, retrying transient
-// failures. No third-party proxy is used.
 func downloadWithRetry(url, dst string, attempts int) error {
 	var err error
 	for i := 0; i < attempts; i++ {
@@ -140,13 +128,16 @@ func manualHint() {
 }
 
 // installStaged swaps stagePath into place with backup + restart + health-check +
-// rollback. stagePath and binaryPath share a directory, so the swap is atomic.
+// rollback. Before the new daemon starts, invoke the NEW binary's privileged
+// network-tune mode. That makes self-update apply the release's current symmetric
+// BBR/buffer policy too; otherwise an old host could keep stale one-way window
+// ceilings indefinitely even after its binary was upgraded.
 func installStaged(label string) {
 	if st, err := os.Stat(stagePath); err != nil || st.Size() < minBinarySize {
 		color.Red("[x] Staged binary missing or too small; aborting update.")
 		return
 	}
-	os.Chmod(stagePath, 0755)
+	_ = os.Chmod(stagePath, 0755)
 
 	color.Cyan("[*] Backing up the current binary...")
 	if err := os.Rename(binaryPath, backupPath); err != nil {
@@ -158,10 +149,16 @@ func installStaged(label string) {
 		rollback()
 		return
 	}
-	os.Chmod(binaryPath, 0755)
+	_ = os.Chmod(binaryPath, 0755)
+
+	// Best effort because kernels/containers may intentionally disallow some
+	// sysctls. The daemon itself is still valid if tuning is unavailable.
+	if err := exec.Command(binaryPath, "--network-tune").Run(); err != nil {
+		color.Yellow("[-] Network tuning could not be fully applied; continuing update.")
+	}
 
 	color.Cyan("[*] Restarting daemon...")
-	exec.Command("systemctl", "restart", "hedioum.service").Run()
+	_ = exec.Command("systemctl", "restart", "hedioum.service").Run()
 	time.Sleep(2 * time.Second)
 	if err := exec.Command("systemctl", "is-active", "--quiet", "hedioum.service").Run(); err != nil {
 		color.HiRed("[!] New version failed to start; rolling back!")
@@ -169,12 +166,10 @@ func installStaged(label string) {
 		return
 	}
 
-	os.Remove(backupPath)
+	_ = os.Remove(backupPath)
 	color.Green("\n[✓] Update successful (%s).", label)
 }
 
-// copyFile copies src to dst (used for the manual --file path; handles src on a
-// different filesystem than dst).
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -190,37 +185,39 @@ func copyFile(src, dst string) error {
 		os.Remove(dst)
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		os.Remove(dst)
+		return err
+	}
+	return nil
 }
 
-// rollback restores the previous binary and restarts the service
 func rollback() {
 	if err := os.Rename(backupPath, binaryPath); err != nil {
 		color.Red("[x] FATAL: Rollback failed! Manual intervention required.")
 		return
 	}
-	exec.Command("systemctl", "restart", "hedioum.service").Run()
+	_ = exec.Command("systemctl", "restart", "hedioum.service").Run()
 	color.Yellow("[-] System has been successfully rolled back to the previous version.")
 }
 
-// Uninstall safely purges all Hedioum components from the server
 func Uninstall() {
 	color.Yellow("[*] Stopping and disabling Hedioum service...")
-	exec.Command("systemctl", "stop", "hedioum.service").Run()
-	exec.Command("systemctl", "disable", "hedioum.service").Run()
+	_ = exec.Command("systemctl", "stop", "hedioum.service").Run()
+	_ = exec.Command("systemctl", "disable", "hedioum.service").Run()
 
 	color.Yellow("[*] Removing Systemd service file...")
-	os.Remove("/etc/systemd/system/hedioum.service")
-	exec.Command("systemctl", "daemon-reload").Run()
+	_ = os.Remove("/etc/systemd/system/hedioum.service")
+	_ = exec.Command("systemctl", "daemon-reload").Run()
 
 	color.Yellow("[*] Removing binaries and configuration files...")
-	os.RemoveAll("/etc/hedioum")
-	os.Remove(binaryPath)
-	os.Remove(backupPath)
+	_ = os.RemoveAll("/etc/hedioum")
+	_ = os.Remove(binaryPath)
+	_ = os.Remove(backupPath)
 
 	if isUFWActive() {
 		color.Yellow("[*] Removing UFW firewall rule for port 2022...")
-		exec.Command("ufw", "delete", "allow", "2022/tcp").Run()
+		_ = exec.Command("ufw", "delete", "allow", "2022/tcp").Run()
 	}
 
 	color.Green("[✓] Hedioum has been completely removed from this system.")

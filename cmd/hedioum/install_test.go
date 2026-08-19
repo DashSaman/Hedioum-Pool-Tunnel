@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-// TestRenderUnitCapabilities verifies the hub gains CAP_NET_ADMIN (for TUN) while
-// the foreign stays bound to just CAP_NET_BIND_SERVICE.
 func TestRenderUnitCapabilities(t *testing.T) {
 	hub := renderUnit(true)
 	if !strings.Contains(hub, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN") {
@@ -17,7 +15,6 @@ func TestRenderUnitCapabilities(t *testing.T) {
 	}
 
 	foreign := renderUnit(false)
-	// The directive lines (not the explanatory comment) must be bind-service only.
 	if !strings.Contains(foreign, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\n") {
 		t.Errorf("foreign bounding set must be CAP_NET_BIND_SERVICE only:\n%s", foreign)
 	}
@@ -27,10 +24,25 @@ func TestRenderUnitCapabilities(t *testing.T) {
 	if strings.Contains(foreign, "CAP_NET_BIND_SERVICE CAP_NET_ADMIN") {
 		t.Errorf("foreign unit must NOT grant CAP_NET_ADMIN on a directive line:\n%s", foreign)
 	}
-	// The template must not leak Go template syntax into the rendered unit.
 	for _, u := range []string{hub, foreign} {
 		if strings.Contains(u, "{{") || strings.Contains(u, "}}") {
 			t.Errorf("unrendered template directive left in unit:\n%s", u)
+		}
+	}
+}
+
+func TestNetworkSysctlConfigIsSymmetricHighBDP(t *testing.T) {
+	for _, want := range []string{
+		"net.core.default_qdisc=fq",
+		"net.ipv4.tcp_congestion_control=bbr",
+		"net.core.rmem_max=33554432",
+		"net.core.wmem_max=33554432",
+		"net.ipv4.tcp_rmem=4096 262144 33554432",
+		"net.ipv4.tcp_wmem=4096 262144 33554432",
+		"net.ipv4.tcp_mtu_probing=1",
+	} {
+		if !strings.Contains(networkSysctlConfig, want) {
+			t.Errorf("network tuning missing %q", want)
 		}
 	}
 }

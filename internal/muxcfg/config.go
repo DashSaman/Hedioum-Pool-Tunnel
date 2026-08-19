@@ -12,13 +12,17 @@ import (
 const (
 	StreamWindow = 16 << 20 // 16 MiB: high-RTT bandwidth-delay-product headroom
 	AcceptBacklog = 1024
-	// Opening a stream is a control RTT over an already-established physical pipe;
-	// several seconds is generous even on high-latency WANs and avoids a zombie
-	// session stalling one client request for Yamux's much longer default timeout.
-	OpenTimeout = 5 * time.Second
-	// A local socket write blocked for 10s indicates a badly wedged physical pipe;
-	// fail it so the pool can move traffic to another session.
-	WriteTimeout = 10 * time.Second
+	// A stream open is normally one control RTT, but Iran↔foreign paths can briefly
+	// pause for several seconds under loss/retransmission. Five seconds was too
+	// aggressive because Yamux closes the WHOLE physical session when this timeout
+	// fires. Ten seconds still detects a wedged pipe quickly without converting a
+	// transient WAN stall into a mass user disconnect.
+	OpenTimeout = 10 * time.Second
+	// Yamux uses this value both for queued writes and Ping replies. Ten seconds can
+	// be reached during a transient congestion/loss episode even while TCP is still
+	// recovering. Give the kernel retransmission machinery room to recover before
+	// declaring the shared physical pipe dead and dropping all logical streams.
+	WriteTimeout = 30 * time.Second
 	CloseTimeout = 5 * time.Minute
 )
 

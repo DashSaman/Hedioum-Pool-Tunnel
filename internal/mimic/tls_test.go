@@ -82,6 +82,97 @@ func TestTLSMimicRoundTrip(t *testing.T) {
 	}
 }
 
+// TestTLSServerAuthCannotStallForever reproduces the production leak where a peer
+// completed TLS but never sent Hedioum's channel auth. The Accept goroutine must be
+// released by the same handshake deadline rather than keeping an FD forever.
+func TestTLSServerAuthCannotStallForever(t *testing.T) {
+	old := tlsHandshakeTimeout
+	tlsHandshakeTimeout = 150 * time.Millisecond
+	defer func() { tlsHandshakeTimeout = old }()
+
+	srv, ln := newTLSServer(t, "server-token")
+	defer ln.Close()
+	done := make(chan error, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		_, _, err = srv.Accept(conn)
+		done <- err
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: "example"})
+	if err := tc.Handshake(); err != nil {
+		t.Fatalf("TLS handshake: %v", err)
+	}
+	// Deliberately send no Hedioum auth after a valid TLS handshake.
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("stalled auth unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("server auth remained stuck after handshake deadline")
+	}
+}
+
+// TestTLSClientAuthAckCannotStallForever covers the mirror image on the Iran hub:
+// a TLS endpoint that accepts the client auth but never acknowledges it must not
+// block a pool replenish worker forever.
+func TestTLSClientAuthAckCannotStallForever(t *testing.T) {
+	old := tlsHandshakeTimeout
+	tlsHandshakeTimeout = 150 * time.Millisecond
+	defer func() { tlsHandshakeTimeout = old }()
+
+	cert, err := tlscert.LoadOrCreate(t.TempDir(), "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		tc := tls.Server(conn, &tls.Config{Certificates: []tls.Certificate{cert}})
+		if tc.Handshake() != nil {
+			return
+		}
+		// Read the complete client channel-auth message so the client reaches the
+		// ACK wait, then intentionally never send the 32-byte server ACK.
+		buf := make([]byte, len(tlsAuthMagic)+tlsNonceLen+tlsMACLen)
+		_, _ = io.ReadFull(tc, buf)
+		time.Sleep(500 * time.Millisecond)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	start := time.Now()
+	_, err = (&TLSClient{Token: "server-token", ServerName: "example"}).Dial(conn)
+	if err == nil {
+		t.Fatal("client auth unexpectedly succeeded without server ACK")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("client auth timeout took too long: %v", elapsed)
+	}
+}
+
 // TestTLSMimicALPNIsHTTP11 guards the ALPN fix: a client offering h2 + http/1.1 must
 // negotiate http/1.1 (never h2), because the decoys speak HTTP/1.1 — negotiating h2
 // left real browsers with an empty page (found in live testing).

@@ -11,9 +11,10 @@ import (
 )
 
 const (
-	udpIdleTimeout = 60 * time.Second // close a UDP flow after this much silence
-	udpMaxFlows    = 256              // per-stream NAT table cap (FD/memory guard)
-	udpReadBufSize = 64 * 1024
+	udpIdleTimeout       = 60 * time.Second // close a UDP flow after this much silence
+	udpMaxFlows          = 256              // per-stream NAT table cap (FD/memory guard)
+	udpReadBufSize       = 64 * 1024
+	udpSocketBufferBytes = 4 << 20 // best-effort kernel burst buffer per active flow
 )
 
 // dialUDP is the seam used to open a vetted UDP socket to a target; overridable
@@ -159,6 +160,12 @@ func handleUDPStream(stream net.Conn) {
 				}
 				continue
 			}
+			// Outer-TCP/Yamux scheduling stalls should not immediately overflow the
+			// connected UDP socket and lose QUIC/voice responses. Linux may clamp these
+			// requests to net.core.{r,w}mem_max; bare-metal installation raises those
+			// ceilings symmetrically on both tunnel endpoints.
+			_ = uconn.SetReadBuffer(udpSocketBufferBytes)
+			_ = uconn.SetWriteBuffer(udpSocketBufferBytes)
 			f = &udpFlow{conn: uconn, target: addr}
 			flows[key] = f
 

@@ -1,0 +1,70 @@
+name: Fork Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - FORK_VERSION
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(tr -d '[:space:]' < FORK_VERSION)"
+          test -n "$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          grep -Fq "const AppVersion = \"$VERSION\"" cmd/hedioum/main.go
+
+      - name: Test before release
+        run: go test ./...
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o dist/hedioum-tunnel ./cmd/hedioum
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dist/hedioum-tunnel-arm64 ./cmd/hedioum
+          sha256sum dist/hedioum-tunnel dist/hedioum-tunnel-arm64 > dist/SHA256SUMS
+          test "$(stat -c%s dist/hedioum-tunnel)" -gt 1048576
+          test "$(stat -c%s dist/hedioum-tunnel-arm64)" -gt 1048576
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" \
+              dist/hedioum-tunnel \
+              dist/hedioum-tunnel-arm64 \
+              dist/SHA256SUMS \
+              --clobber
+          else
+            gh release create "$VERSION" \
+              dist/hedioum-tunnel \
+              dist/hedioum-tunnel-arm64 \
+              dist/SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --title "Hedioum $VERSION — DashSaman stability/throughput fork" \
+              --notes "Production hardening based on upstream v0.11.0: removes artificial hot-path bandwidth shaping, uses symmetric high-RTT Yamux settings, hardens pool recovery and endpoint failover, preserves full-duplex TCP half-close semantics, and fixes UDP flow/timer races. CI includes unit/integration tests, race detection, vet, and Linux build."
+          fi

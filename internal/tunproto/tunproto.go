@@ -10,23 +10,21 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
-// Stream types (first byte of every logical stream).
 const (
 	StreamTCP       byte = 0x01
 	StreamUDP       byte = 0x03
-	StreamSpeedtest byte = 0x05 // [0x05][dir 1B][u16 seconds] then random data
+	StreamSpeedtest byte = 0x05
 )
 
-// Speedtest directions (from the hub's perspective).
 const (
-	SpeedDown byte = 0x01 // egress sends, hub receives (download)
-	SpeedUp   byte = 0x02 // hub sends, egress receives (upload)
+	SpeedDown byte = 0x01
+	SpeedUp   byte = 0x02
 )
 
-// WriteSpeedtestHeader writes [StreamSpeedtest][dir][u16 seconds].
 func WriteSpeedtestHeader(w io.Writer, dir byte, seconds uint16) error {
 	var b [4]byte
 	b[0] = StreamSpeedtest
@@ -36,8 +34,6 @@ func WriteSpeedtestHeader(w io.Writer, dir byte, seconds uint16) error {
 	return err
 }
 
-// ReadSpeedtestHeader reads [dir][u16 seconds] (the stream type byte must already
-// be consumed via ReadStreamType).
 func ReadSpeedtestHeader(r io.Reader) (dir byte, seconds uint16, err error) {
 	var b [3]byte
 	if _, err = io.ReadFull(r, b[:]); err != nil {
@@ -46,9 +42,6 @@ func ReadSpeedtestHeader(r io.Reader) (dir byte, seconds uint16, err error) {
 	return b[0], binary.BigEndian.Uint16(b[1:3]), nil
 }
 
-// SpeedtestResult is sent by the receiver after an upload test. Bytes is what the
-// FOREIGN endpoint actually received, not what the hub merely queued into Yamux;
-// Elapsed is measured by that receiver from first-read loop start through EOF.
 type SpeedtestResult struct {
 	Bytes   uint64
 	Elapsed time.Duration
@@ -77,7 +70,6 @@ func ReadSpeedtestResult(r io.Reader) (SpeedtestResult, error) {
 	}, nil
 }
 
-// SOCKS-style address types.
 const (
 	atypIPv4   byte = 0x01
 	atypDomain byte = 0x03
@@ -95,6 +87,13 @@ var (
 	errShortAddr  = errors.New("tunproto: truncated address")
 	errBadAtyp    = errors.New("tunproto: unknown address type")
 	errEmptyChunk = errors.New("tunproto: empty datagram record")
+
+	// Outbound UDP framing is extremely hot for QUIC. Reusing one maximum-sized
+	// scratch buffer per active P avoids a heap allocation for every datagram while
+	// preserving the single-Write record atomicity expected by callers.
+	datagramWritePool = sync.Pool{New: func() any {
+		return make([]byte, maxRecord+2)
+	}}
 )
 
 func ReadStreamType(r io.Reader) (byte, error) {
@@ -104,8 +103,6 @@ func ReadStreamType(r io.Reader) (byte, error) {
 	}
 	return b[0], nil
 }
-
-// --- TCP header ---
 
 func WriteTCPHeader(w io.Writer, target string) error {
 	if len(target) == 0 || len(target) > maxTargetLen {
@@ -134,8 +131,6 @@ func ReadTCPTarget(r io.Reader) (string, error) {
 	}
 	return string(buf), nil
 }
-
-// --- UDP header + datagrams ---
 
 func WriteUDPHeader(w io.Writer) error {
 	_, err := w.Write([]byte{StreamUDP})
@@ -190,14 +185,14 @@ func decodeAddr(b []byte) (Addr, int, error) {
 	}
 	switch b[0] {
 	case atypIPv4:
-		if len(b) < 1+4+2 {
+		if len(b) < 7 {
 			return Addr{}, 0, errShortAddr
 		}
 		ip := make(net.IP, 4)
 		copy(ip, b[1:5])
 		return Addr{IP: ip, Port: binary.BigEndian.Uint16(b[5:7])}, 7, nil
 	case atypIPv6:
-		if len(b) < 1+16+2 {
+		if len(b) < 19 {
 			return Addr{}, 0, errShortAddr
 		}
 		ip := make(net.IP, 16)
@@ -219,8 +214,6 @@ func decodeAddr(b []byte) (Addr, int, error) {
 	}
 }
 
-// WriteDatagram uses one write so concurrent callers can preserve record atomicity
-// by serializing at the call boundary.
 func WriteDatagram(w io.Writer, addr Addr, payload []byte) error {
 	recordLen := addr.encodedLen() + len(payload)
 	if recordLen == 0 {
@@ -229,17 +222,18 @@ func WriteDatagram(w io.Writer, addr Addr, payload []byte) error {
 	if recordLen > maxRecord {
 		return errRecordLen
 	}
-	buf := make([]byte, 2+recordLen)
+	storage := datagramWritePool.Get().([]byte)
+	buf := storage[:2+recordLen]
 	binary.BigEndian.PutUint16(buf[0:2], uint16(recordLen))
 	n := addr.encode(buf[2:])
 	copy(buf[2+n:], payload)
 	_, err := w.Write(buf)
+	datagramWritePool.Put(storage)
 	return err
 }
 
-// ReadDatagram allocates one owned record buffer. The returned payload is a slice
-// of that owned record rather than a second allocation+copy. At high QUIC packet
-// rates this removes one heap allocation and payload copy per tunnel datagram.
+// ReadDatagram performs one allocation for the owned record. Returning record[n:]
+// avoids the second payload allocation/copy that used to amplify GC at high pps.
 func ReadDatagram(r io.Reader) (Addr, []byte, error) {
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {

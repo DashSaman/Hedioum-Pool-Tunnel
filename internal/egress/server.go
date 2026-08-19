@@ -1,6 +1,7 @@
 package egress
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -22,7 +23,10 @@ import (
 )
 
 const (
-	dialTimeout = 10 * time.Second
+	dialTimeout       = 10 * time.Second
+	resolveTimeout    = 5 * time.Second
+	maxAcceptBackoff  = time.Second
+	firstAcceptBackoff = 5 * time.Millisecond
 
 	egressIPv4 = "ipv4"
 	egressIPv6 = "ipv6"
@@ -74,7 +78,7 @@ func StartForeignDaemon(cfg *config.AppConfig) {
 		go startHTTPServer(cfg.HTTPDecoyPort, certMgr, cfg)
 	}
 
-	sysutil.WaitForTerminationSignal() // block until terminated (see helper)
+	sysutil.WaitForTerminationSignal()
 }
 
 // startHTTPServer runs the plaintext :80 endpoint: ACME HTTP-01 challenge handling,
@@ -114,38 +118,47 @@ func startMimicListener(cfg *config.AppConfig, ml config.MimicListener, filter *
 		slog.Error("failed to bind mimic listener", "type", ml.Type, "addr", listenAddr, "err", err)
 		return
 	}
+	defer listener.Close()
 	slog.Info("mimic listener active", "type", ml.Type, "addr", listenAddr)
 
+	// Resource pressure (EMFILE/ENFILE, temporary network errors) must not turn a
+	// failed Accept into a tight CPU loop. Exponential backoff keeps the daemon
+	// responsive and gives closed user sessions time to release descriptors.
+	var acceptDelay time.Duration
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			if acceptDelay == 0 {
+				acceptDelay = firstAcceptBackoff
+			} else {
+				acceptDelay *= 2
+				if acceptDelay > maxAcceptBackoff {
+					acceptDelay = maxAcceptBackoff
+				}
+			}
+			slog.Debug("mimic accept failed; backing off", "type", ml.Type, "delay", acceptDelay, "err", err)
+			time.Sleep(acceptDelay)
 			continue
 		}
+		acceptDelay = 0
 		go handleIncomingConnection(conn, m, ml.Type)
 	}
 }
 
 // buildServerMimic constructs the server-side camouflage for a listener.
 func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *securestream.ReplayFilter, certMgr *tlscert.CertManager) (mimic.ServerMimic, error) {
-	// Per-install decoy identity (server version / date / ETag), seeded from the
-	// secret token so the web decoy is not byte-identical across the fleet.
 	decoy := mimic.NewDecoyProfile(cfg.AuthToken)
 	switch ml.Type {
 	case "tls", "smtps", "imaps", "https-alt":
-		// Implicit TLS: the wire is TLS from the first byte (like HTTPS/IMAPS/SMTPS).
-		// smtps/imaps/https-alt are the same mimic as tls, just on their conventional
-		// ports. These present the real (ACME) cert when a domain is configured.
 		return &mimic.TLSMimic{
 			Token:          cfg.AuthToken,
 			Filter:         filter,
 			GetCertificate: certMgr.GetCertificate,
 			NextProtos:     certMgr.NextProtos(),
-			DecoyAddr:      ml.Decoy, // "" -> built-in persona page
+			DecoyAddr:      ml.Decoy,
 			Decoy:          decoy.WebDecoyFor(cfg.DecoyStyle),
 		}, nil
 	case "docker":
-		// Container-registry persona on :5000 — implicit TLS; an unauthorized probe
-		// gets a docker/distribution Registry v2 API challenge (401 + registry marker).
 		return &mimic.TLSMimic{
 			Token:          cfg.AuthToken,
 			Filter:         filter,
@@ -155,8 +168,6 @@ func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *se
 			Decoy:          mimic.ServeDockerRegistry,
 		}, nil
 	case "grafana":
-		// Grafana persona on :3000 — implicit TLS; an unauthorized probe gets the
-		// default Grafana login + the unauthenticated /api/health JSON.
 		return &mimic.TLSMimic{
 			Token:          cfg.AuthToken,
 			Filter:         filter,
@@ -166,8 +177,6 @@ func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *se
 			Decoy:          mimic.ServeGrafana,
 		}, nil
 	case "prometheus":
-		// Prometheus persona on :9090 — implicit TLS; an unauthorized probe gets the
-		// real /-/healthy, /metrics and /api/v1 fingerprints.
 		return &mimic.TLSMimic{
 			Token:          cfg.AuthToken,
 			Filter:         filter,
@@ -177,8 +186,6 @@ func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *se
 			Decoy:          mimic.ServePrometheus,
 		}, nil
 	case "cpanel", "whm", "webmail":
-		// cpsrvd panel personas on :2083 / :2087 / :2096 — implicit TLS; an unauthorized
-		// probe gets the matching cPanel/WHM/Webmail login (same cpsrvd template).
 		cpsrvdDecoy := map[string]func(net.Conn){
 			"cpanel": mimic.ServeCPanel, "whm": mimic.ServeWHM, "webmail": mimic.ServeWebmail,
 		}[ml.Type]
@@ -191,12 +198,6 @@ func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *se
 			Decoy:          cpsrvdDecoy,
 		}, nil
 	case "directadmin":
-		// The DirectAdmin panel persona on :2222. It presents the real (ACME) cert
-		// when a domain is configured — exactly like a well-run panel with a hostname
-		// certificate — and falls back to self-signed otherwise (also authentic for a
-		// default DirectAdmin install). The decoy for unauthorized probes is the
-		// DirectAdmin login; an operator running a real panel can set ml.Decoy to
-		// proxy to it for perfect fidelity.
 		return &mimic.TLSMimic{
 			Token:          cfg.AuthToken,
 			Filter:         filter,
@@ -206,9 +207,6 @@ func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *se
 			Decoy:          mimic.ServeDirectAdminPanel,
 		}, nil
 	case "smtp", "imap", "postgres", "mysql":
-		// STARTTLS family: a plaintext protocol prologue upgrades to the same TLS
-		// mimic. smtp/imap look like a mail server negotiating STARTTLS; postgres/
-		// mysql look like a database negotiating SSL, then TLS.
 		return &mimic.StartTLSMimic{Proto: ml.Type, TLS: &mimic.TLSMimic{
 			Token:          cfg.AuthToken,
 			Filter:         filter,
@@ -222,8 +220,6 @@ func buildServerMimic(cfg *config.AppConfig, ml config.MimicListener, filter *se
 		if sshDecoy == "" {
 			sshDecoy = fmt.Sprintf("127.0.0.1:%d", cfg.DecoyPort)
 		}
-		// Mirror the real sshd banner so a genuine SSH client routed to the decoy
-		// completes key exchange; kept fresh across boot races / sshd upgrades.
 		banner := newDecoyBannerMirror(sshDecoy)
 		return &mimic.SSHMimic{Token: cfg.AuthToken, Filter: filter, DecoyAddr: sshDecoy, Banner: banner.get}, nil
 	}
@@ -239,8 +235,6 @@ type decoyBannerMirror struct {
 func newDecoyBannerMirror(addr string) *decoyBannerMirror {
 	m := &decoyBannerMirror{}
 	m.v.Store("")
-	// Best-effort synchronous first fetch so the common case (sshd already up) has
-	// the banner ready before we accept connections.
 	if b, err := mimic.FetchRealSSHBanner(addr); err == nil && b != "" {
 		m.v.Store(b)
 		slog.Info("mirroring decoy SSH banner")
@@ -251,14 +245,12 @@ func newDecoyBannerMirror(addr string) *decoyBannerMirror {
 	return m
 }
 
-// get returns the current mirrored banner ("" -> the handshake will synthesize one).
 func (m *decoyBannerMirror) get() string {
 	s, _ := m.v.Load().(string)
 	return s
 }
 
 func (m *decoyBannerMirror) refreshLoop(addr string) {
-	// Retry quickly until we have a banner (covers sshd coming up after us on boot).
 	for m.get() == "" {
 		time.Sleep(3 * time.Second)
 		if b, err := mimic.FetchRealSSHBanner(addr); err == nil && b != "" {
@@ -267,7 +259,6 @@ func (m *decoyBannerMirror) refreshLoop(addr string) {
 			break
 		}
 	}
-	// Then refresh slowly to follow sshd restarts/upgrades.
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
@@ -279,19 +270,11 @@ func (m *decoyBannerMirror) refreshLoop(addr string) {
 
 // handleIncomingConnection runs the mimic handshake, diverts unauthorized probes
 // to the mimic's decoy, or establishes the Yamux tunnel.
-// label is the configured listener type (ssh/tls/smtp/imap/smtps/imaps); it is
-// used for logging so implicit-TLS variants are distinguished from plain tls,
-// which share the same underlying mimic and Name().
 func handleIncomingConnection(conn net.Conn, m mimic.ServerMimic, label string) {
 	clientIP, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 
-	// 1. Camouflage + authenticate. On failure we receive a replay conn carrying
-	// the exact bytes the peer sent, to forward to the decoy backend.
 	secureConn, replayConn, err := m.Accept(conn)
 	if err != nil {
-		// A wrong credential, a replayed handshake, or a probe not speaking our
-		// protocol. Route it to the decoy so the port looks like a real service
-		// (no ban, uniform behavior).
 		if errors.Is(err, securestream.ErrAuth) {
 			slog.Debug("unauthorized/replayed probe; routing to decoy", "client_ip", clientIP, "mimic", label)
 		}
@@ -303,22 +286,16 @@ func handleIncomingConnection(conn net.Conn, m mimic.ServerMimic, label string) 
 		return
 	}
 
-	// 2. Elevate the authenticated, decrypted connection to a Yamux server using
-	// exactly the same high-RTT flow-control profile as the hub.
-	yamuxCfg := muxcfg.WAN()
-	session, err := yamux.Server(secureConn, yamuxCfg)
+	session, err := yamux.Server(secureConn, muxcfg.WAN())
 	if err != nil {
 		_ = secureConn.Close()
 		return
 	}
 
 	slog.Info("authentic hub connection established", "client_ip", clientIP, "mimic", label)
-
-	// 3. Accept logical streams from the Hub and route them to the open internet.
 	go handleYamuxSession(session)
 }
 
-// handleYamuxSession accepts individual user streams multiplexed over the single physical link.
 func handleYamuxSession(session *yamux.Session) {
 	for {
 		stream, err := session.AcceptStream()
@@ -326,13 +303,10 @@ func handleYamuxSession(session *yamux.Session) {
 			_ = session.Close()
 			return
 		}
-
 		go handleLogicalStream(stream)
 	}
 }
 
-// handleLogicalStream dispatches a logical stream on its leading type byte:
-// TCP CONNECT is piped to the internet; UDP ASSOCIATE is relayed as datagrams.
 func handleLogicalStream(stream net.Conn) {
 	defer stream.Close()
 
@@ -347,20 +321,15 @@ func handleLogicalStream(stream net.Conn) {
 		handleUDPStream(stream)
 	case tunproto.StreamSpeedtest:
 		handleSpeedtestStream(stream)
-	default:
-		// Unknown stream type: drop.
 	}
 }
 
-// handleTCPStream reads the target address and pipes data to the internet.
 func handleTCPStream(stream net.Conn) {
 	targetAddr, err := tunproto.ReadTCPTarget(stream)
 	if err != nil {
 		return
 	}
 
-	// SSRF-safe dial: resolve once, vet the address, and dial that exact IP
-	// (no second lookup -> no DNS rebinding). Fails closed on resolution errors.
 	remoteConn, err := safeDialTarget(targetAddr)
 	if err != nil {
 		if errors.Is(err, errBlockedTarget) {
@@ -370,22 +339,15 @@ func handleTCPStream(stream net.Conn) {
 	}
 	defer remoteConn.Close()
 
-	// Full-duplex copy with FIN/half-close propagation. Waiting for both directions
-	// prevents request EOF from truncating a response that is still in flight.
 	_ = pipe.Bidirectional(stream, remoteConn)
 }
 
-// errBlockedTarget marks a target rejected for pointing at a non-global address
-// (SSRF attempt), as opposed to an ordinary resolution/dial failure.
 var errBlockedTarget = errors.New("blocked non-global target")
 
-// vetted resolves host at most once to a safe, dialable IP of the family allowed
-// by the egress mode. It single-sources the SSRF policy for both TCP and UDP:
-// dialing the resolved IP (rather than re-resolving) closes the DNS-rebinding
-// TOCTOU, and it fails closed on resolution errors. Returns the IP and whether it
-// is IPv4.
+// vetted resolves host once with an explicit timeout, vets every answer, then
+// returns an exact IP to dial. The old net.LookupIP call could block independently
+// of dialTimeout because resolution happened before net.Dialer was invoked.
 func vetted(host string) (net.IP, bool, error) {
-	// IP literal.
 	if ip := net.ParseIP(host); ip != nil {
 		if !isDialableIP(ip) {
 			return nil, false, fmt.Errorf("%w %s", errBlockedTarget, host)
@@ -393,22 +355,26 @@ func vetted(host string) (net.IP, bool, error) {
 		return pickFamily([]net.IP{ip}, host)
 	}
 
-	// Hostname: resolve once; reject the whole target if ANY resolved address is
-	// non-global (defends against split-horizon answers mixing public + internal).
-	ips, err := net.LookupIP(host)
+	ctx, cancel := context.WithTimeout(context.Background(), resolveTimeout)
+	defer cancel()
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return nil, false, fmt.Errorf("resolve %s: %w", host, err)
 	}
-	for _, ip := range ips {
+	ips := make([]net.IP, 0, len(resolved))
+	for _, addr := range resolved {
+		ip := addr.IP
 		if !isDialableIP(ip) {
 			return nil, false, fmt.Errorf("%w %s (%s)", errBlockedTarget, host, ip)
 		}
+		ips = append(ips, ip)
+	}
+	if len(ips) == 0 {
+		return nil, false, fmt.Errorf("resolve %s: no addresses", host)
 	}
 	return pickFamily(ips, host)
 }
 
-// pickFamily selects a vetted IP honoring the egress family mode. In "dual" and
-// the default "ipv4" mode IPv4 is preferred; "ipv6" forces IPv6.
 func pickFamily(ips []net.IP, host string) (net.IP, bool, error) {
 	var v4, v6 net.IP
 	for _, ip := range ips {
@@ -434,7 +400,7 @@ func pickFamily(ips []net.IP, host string) (net.IP, bool, error) {
 			return v6, false, nil
 		}
 		return nil, false, fmt.Errorf("no dialable address for %s", host)
-	default: // ipv4
+	default:
 		if v4 != nil {
 			return v4, true, nil
 		}
@@ -442,7 +408,6 @@ func pickFamily(ips []net.IP, host string) (net.IP, bool, error) {
 	}
 }
 
-// bindAddrTCP returns the source address to bind, if egressBindIP matches family.
 func bindAddrTCP(isV4 bool) *net.TCPAddr {
 	if egressBindIP != nil && (egressBindIP.To4() != nil) == isV4 {
 		return &net.TCPAddr{IP: egressBindIP}
@@ -450,7 +415,6 @@ func bindAddrTCP(isV4 bool) *net.TCPAddr {
 	return nil
 }
 
-// safeDialTarget vets the TCP target and dials the exact vetted IP.
 func safeDialTarget(target string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
@@ -468,8 +432,6 @@ func safeDialTarget(target string) (net.Conn, error) {
 	return d.Dial(network, net.JoinHostPort(ip.String(), port))
 }
 
-// safeDialUDP vets the UDP target and returns a connected UDP socket to the exact
-// vetted IP (same SSRF policy as TCP; connected so only the target can reply).
 func safeDialUDP(target string) (*net.UDPConn, error) {
 	host, port, err := net.SplitHostPort(target)
 	if err != nil {
@@ -494,19 +456,15 @@ func safeDialUDP(target string) (*net.UDPConn, error) {
 	return net.DialUDP(network, laddr, &net.UDPAddr{IP: ip, Port: p})
 }
 
-// isDialableIP reports whether ip is a public, global unicast internet address
-// safe to dial. It blocks loopback, link-local (incl. 169.254.169.254 cloud
-// metadata), multicast, unspecified, RFC 1918 private, and RFC 6598 CGNAT
-// (100.64.0.0/10, used by some cloud metadata endpoints) addresses.
 func isDialableIP(ip net.IP) bool {
 	if !ip.IsGlobalUnicast() {
-		return false // loopback, link-local, multicast, unspecified
+		return false
 	}
 	if ip.IsPrivate() {
-		return false // 10/8, 172.16/12, 192.168/16, fc00::/7
+		return false
 	}
 	if ip4 := ip.To4(); ip4 != nil && ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
-		return false // 100.64.0.0/10 CGNAT / shared address space
+		return false
 	}
 	return true
 }

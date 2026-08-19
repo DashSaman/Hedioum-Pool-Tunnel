@@ -6,9 +6,9 @@ import (
 	"time"
 )
 
-// TestShouldCloseDraining locks the no-cutover drain policy: empty pipes close,
-// genuinely idle pipes close after grace, and active payload is never killed by a
-// wall-clock hard ceiling.
+// TestShouldCloseDraining locks the strongest no-cutover policy: an empty pipe may
+// close immediately, but ANY open logical stream survives regardless of silence or
+// drain age. Quiet WebSockets/SSH sessions are still real user connections.
 func TestShouldCloseDraining(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -20,9 +20,9 @@ func TestShouldCloseDraining(t *testing.T) {
 		{"empty closes immediately", 0, time.Second, false, true},
 		{"active within grace stays", 1, 10 * time.Second, false, false},
 		{"idle within grace stays", 1, 10 * time.Second, true, false},
-		{"idle past grace closes", 1, 2 * time.Minute, true, true},
+		{"idle past grace still stays", 1, 2 * time.Minute, true, false},
 		{"active past grace stays", 1, 2 * time.Minute, false, false},
-		{"active past old hard ceiling still stays", 1, 45 * time.Minute, false, false},
+		{"idle for hours still stays", 1, 45 * time.Minute, true, false},
 	}
 	for _, c := range cases {
 		if got := shouldCloseDraining(c.streams, c.drainedFor, c.idle); got != c.want {
@@ -78,6 +78,42 @@ func TestActiveCountLocked(t *testing.T) {
 	}
 }
 
+// TestLifecycleNeverBreaksActiveFloor makes every physical session eligible for
+// retirement in the same health tick. The pool must keep minConnections active;
+// retirement is make-before-break rather than draining the whole slice at once.
+func TestLifecycleNeverBreaksActiveFloor(t *testing.T) {
+	np := &NodePool{
+		Alias:          "floor",
+		label:          "tcp",
+		minConnections: 2,
+		maxConnections: 4,
+		baseLimitMbps:  10,
+		dialer:         fakeDialer,
+		lifecycle:      NewLifecyclePolicy("floor-test"),
+		shutdown:       make(chan struct{}),
+	}
+	defer np.stop()
+
+	for i := 0; i < 4; i++ {
+		sess, _, err := fakeDialer()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ys := NewYamuxSession(sess, 10, 0, "tls", np.lifecycle)
+		ys.retireAfter = time.Nanosecond
+		ys.bornAt = time.Now().Add(-time.Second)
+		np.sessions = append(np.sessions, ys)
+	}
+
+	np.evaluateHealthAndScale()
+	np.mu.RLock()
+	active := np.activeCountLocked()
+	np.mu.RUnlock()
+	if active < np.minConnections {
+		t.Fatalf("lifecycle broke active floor: active=%d min=%d", active, np.minConnections)
+	}
+}
+
 // TestReplenishNotBlockedByLiveDrainers is the issue #23 regression: live draining
 // pipes do not count as active and must not prevent fresh ACTIVE capacity from
 // being established. Replenishment is intentionally asynchronous now.
@@ -126,7 +162,8 @@ func TestReplenishNotBlockedByLiveDrainers(t *testing.T) {
 }
 
 // TestSafetyCeilingNeverEvictsLiveDrainer proves that the safety cap prefers
-// temporary under-capacity over terminating an active user transfer.
+// temporary under-capacity over terminating an open user stream, even if that
+// stream has carried no payload for a long time.
 func TestSafetyCeilingNeverEvictsLiveDrainer(t *testing.T) {
 	np := &NodePool{
 		Alias:          "n1",
@@ -151,6 +188,7 @@ func TestSafetyCeilingNeverEvictsLiveDrainer(t *testing.T) {
 		if _, err := ys.OpenStream(); err != nil {
 			t.Fatalf("open stream: %v", err)
 		}
+		atomic.StoreInt64(&ys.lastActivityUnixNano, time.Now().Add(-time.Hour).UnixNano())
 		ys.SetDraining()
 		original = append(original, ys)
 		np.sessions = append(np.sessions, ys)
@@ -168,9 +206,9 @@ func TestSafetyCeilingNeverEvictsLiveDrainer(t *testing.T) {
 	}
 }
 
-// TestSafeIdleDrainerCanBeEvicted verifies that recovery can still make progress
-// when a drainer really is stale/idle rather than carrying active payload.
-func TestSafeIdleDrainerCanBeEvicted(t *testing.T) {
+// TestEmptyDrainerCanBeEvicted verifies that recovery can still make progress when
+// a drainer has no logical streams left.
+func TestEmptyDrainerCanBeEvicted(t *testing.T) {
 	np := &NodePool{
 		Alias:          "n1",
 		label:          "tcp",
@@ -191,8 +229,6 @@ func TestSafeIdleDrainerCanBeEvicted(t *testing.T) {
 		}
 		ys := NewYamuxSession(sess, 10, 0, "tls", np.lifecycle)
 		ys.SetDraining()
-		// Simulate an actually stale drainer.
-		atomic.StoreInt64(&ys.lastActivityUnixNano, time.Now().Add(-2*drainSoftGrace).UnixNano())
 		np.sessions = append(np.sessions, ys)
 	}
 
@@ -203,9 +239,9 @@ func TestSafeIdleDrainerCanBeEvicted(t *testing.T) {
 	total := len(np.sessions)
 	np.mu.RUnlock()
 	if active != 1 {
-		t.Fatalf("safe eviction did not admit fresh active pipe: active=%d", active)
+		t.Fatalf("empty eviction did not admit fresh active pipe: active=%d", active)
 	}
 	if total != capN {
-		t.Fatalf("safe eviction should replace one-for-one: total=%d want %d", total, capN)
+		t.Fatalf("empty eviction should replace one-for-one: total=%d want %d", total, capN)
 	}
 }

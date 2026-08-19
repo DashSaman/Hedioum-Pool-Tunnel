@@ -1,11 +1,10 @@
 #!/bin/bash
 # ==========================================================
-# Hedioum Dynamic Pool Tunnel - minimal bootstrap
+# Hedioum Dynamic Pool Tunnel - DashSaman performance/stability fork
 #
 # This script only: (1) checks the CPU architecture, (2) downloads the matching
-# release binary from GitHub, (3) runs it. The BINARY itself does everything else
-# (self-copy to /usr/local/bin, systemd service, firewall, config), so installing
-# via this script and running the binary by hand are equivalent.
+# release binary from THIS fork, (3) runs it. The binary itself handles self-copy,
+# systemd, firewall, configuration and future updates.
 # ==========================================================
 set -euo pipefail
 
@@ -20,11 +19,12 @@ case "$(uname -m)" in
 esac
 echo "[*] Architecture asset: $ASSET"
 
-URL="https://github.com/hedioum/Hedioum-Pool-Tunnel/releases/latest/download/${ASSET}"
+REPO="DashSaman/Hedioum-Pool-Tunnel"
+URL="https://github.com/${REPO}/releases/latest/download/${ASSET}"
 TMP="$(mktemp)"
 trap 'rm -f "$TMP"' EXIT
 
-echo "[*] Downloading the latest release from GitHub..."
+echo "[*] Downloading the latest DashSaman fork release from GitHub..."
 ok=""
 for attempt in 1 2 3; do
   if curl -fL --connect-timeout 15 -o "$TMP" "$URL"; then ok=1; break; fi
@@ -34,11 +34,18 @@ done
 
 if [ -z "$ok" ]; then
   cat <<EOF
-[x] Download failed. GitHub may be blocked on this network.
-    Download '${ASSET}' manually on another machine, copy it to this server, then:
+[x] Download failed. GitHub may be blocked on this network, or the fork release is not available yet.
+    Download '${ASSET}' manually from ${REPO} Releases, copy it to this server, then:
         chmod +x ${ASSET} && ./${ASSET} install
     and configure with 'hedioum-tunnel' (wizard) or the setup-* subcommands.
 EOF
+  exit 1
+fi
+
+# Refuse an obviously incomplete/error-page download before executing it.
+SIZE="$(wc -c < "$TMP" 2>/dev/null || echo 0)"
+if [ "$SIZE" -lt 1048576 ]; then
+  echo "[x] Downloaded file is unexpectedly small (${SIZE} bytes); refusing to execute it."
   exit 1
 fi
 

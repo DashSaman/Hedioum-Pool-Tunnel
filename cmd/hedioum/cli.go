@@ -10,9 +10,6 @@ import (
 	"github.com/fatih/color"
 )
 
-// runSubcommand dispatches a non-flag first argument to a management command.
-// The no-argument invocation (dashboard on a TTY / daemon under systemd) is
-// handled by main() and never reaches here.
 func runSubcommand(name string, args []string) {
 	switch name {
 	case "version":
@@ -41,6 +38,8 @@ func runSubcommand(name string, args []string) {
 		cmdProbe(args)
 	case "test":
 		cmdTestConnection(args)
+	case "optimize":
+		cmdOptimize(args)
 	case "check-ip":
 		cmdCheckIP(args)
 	case "help", "-h", "--help":
@@ -56,40 +55,38 @@ func printUsage() {
 	fmt.Print(`Hedioum Dynamic Pool Tunnel
 
 Usage:
-  hedioum-tunnel                      Interactive dashboard (TTY) or daemon (systemd)
-  hedioum-tunnel version              Print version and build info
-  hedioum-tunnel install              Install/enable the systemd service (self-copy)
-  hedioum-tunnel uninstall [--yes]    Stop, disable, and remove everything
-  hedioum-tunnel update [--file PATH]  Update from GitHub, or from a local binary
+  hedioum-tunnel                         Interactive dashboard (TTY) or daemon (systemd)
+  hedioum-tunnel version                 Print version and build info
+  hedioum-tunnel install                 Install/enable the systemd service (self-copy)
+  hedioum-tunnel uninstall [--yes]       Stop, disable, and remove everything
+  hedioum-tunnel update [--file PATH]    Update from GitHub, or from a local binary
 
   hedioum-tunnel setup-foreign [flags]   Write the foreign (egress) config
-      --listen-port N (default 22)  --decoy-port N (default 2022)
-      --egress-mode ipv4|ipv6|dual  --egress-bind-ip IP  --move-ssh  --token HEX
+      --persona performance              Recommended: SSH-free single-layer TLS set
+      --egress-mode ipv4|ipv6|dual       --egress-bind-ip IP
 
-  hedioum-tunnel edit-foreign [flags]    Edit the foreign config in place (only the
-      flags you pass change; token kept unless --token/--rotate-token)
+  hedioum-tunnel edit-foreign [flags]    Edit the foreign config in place
   hedioum-tunnel setup-iran   [flags]    Write the Iran (hub) config with one node
   hedioum-tunnel add-node     [flags]    Append a foreign node to the hub config
-      --alias NAME  --target HOST:PORT  --socks-port N  --token HEX
+      --alias NAME  --socks-port N  --token PAIRING_TOKEN
       [--min N --max N --bw N --jitter N]
       [--tun [--tun-name hedioumN] [--tun-addr 10.200.N.1/24] [--dns]]
-          --tun also exposes the node as an OS-level interface (opt-in; SOCKS stays
-          on). --tun-name/--tun-addr auto-assign when omitted; --dns adds a leak-free
-          :53 forwarder on the gateway IP.
-  hedioum-tunnel edit-node --alias NAME [flags]  Edit a node in place (only the flags
-      you pass change; token kept unless --token/--rotate-token)
+  hedioum-tunnel edit-node --alias NAME [flags]
   hedioum-tunnel remove-node --alias NAME
-  hedioum-tunnel speedtest [--node NAME] [--mimic ssh|tls] [--seconds N] [--dir down|up|both]
-  hedioum-tunnel probe     [--node NAME]    Test each endpoint (mimic) and report reachability
-  hedioum-tunnel check-ip                   Report the egress IP's reputation (clean vs flagged)
+
+  hedioum-tunnel probe     [--node NAME]
+  hedioum-tunnel test      [--node NAME]
+  hedioum-tunnel speedtest [--node NAME] [--mimic TYPE] [--seconds N] [--dir down|up|both]
+  hedioum-tunnel optimize  [--node NAME] [--seconds 3] [--apply=true]
+      Receiver-measure every endpoint in both directions, rank by worst-direction
+      throughput + symmetry + RTT, save best-first order, and restart the daemon.
+  hedioum-tunnel check-ip
 
 Flags for the default mode:
   --reset            Wipe the config and re-run the setup wizard
-  --open-firewall    Open the listen port on the host firewall and exit
+  --open-firewall    Open configured foreign listen ports and exit
 `)
 }
-
-// --- validation helpers (shared with the wizard) ---
 
 func validPort(p int) error {
 	if p < 1 || p > 65535 {
@@ -105,7 +102,6 @@ func validIP(s string) error {
 	return nil
 }
 
-// validTarget checks a HOST:PORT where HOST is an IPv4/IPv6 literal or hostname.
 func validTarget(s string) error {
 	host, portStr, err := net.SplitHostPort(s)
 	if err != nil {
@@ -124,7 +120,6 @@ func validTarget(s string) error {
 	return validPort(port)
 }
 
-// validToken requires a non-trivial hex string (the tokens we generate are 32 hex).
 func validToken(s string) error {
 	if len(s) < 8 {
 		return fmt.Errorf("token too short (need >= 8 chars)")
@@ -137,7 +132,6 @@ func validToken(s string) error {
 	return nil
 }
 
-// fail prints an error and exits non-zero (for CLI command handlers).
 func fail(format string, a ...interface{}) {
 	color.Red("[x] "+format, a...)
 	os.Exit(1)

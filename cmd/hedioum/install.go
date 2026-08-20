@@ -44,37 +44,38 @@ const (
 	installUnitPath = "/etc/systemd/system/hedioum.service"
 )
 
-// Conservative high-BDP tuning applied identically on Iran and foreign hosts.
-// These are CEILINGS, not preallocated buffers: TCP autotuning grows only busy
-// sockets as required. 32 MiB comfortably covers ~400 Mbps at ~500 ms BDP while
-// avoiding the extreme global memory settings seen in many "speed tweak" scripts.
+// Symmetric high-BDP tuning for both Iran and foreign hosts. These values are
+// autotuning CEILINGS, not preallocated memory. 64 MiB leaves comfortable headroom
+// above the 32 MiB Yamux stream window and covers several-hundred-Mbps paths at
+// very high RTT without silently making one direction receive-window limited.
 const networkSysctlConfig = `net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
-net.core.rmem_max=33554432
-net.core.wmem_max=33554432
-net.ipv4.tcp_rmem=4096 262144 33554432
-net.ipv4.tcp_wmem=4096 262144 33554432
-net.core.netdev_max_backlog=16384
-net.core.somaxconn=4096
+net.core.rmem_max=67108864
+net.core.wmem_max=67108864
+net.ipv4.tcp_rmem=4096 262144 67108864
+net.ipv4.tcp_wmem=4096 262144 67108864
+net.core.netdev_max_backlog=32768
+net.core.somaxconn=8192
 net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_keepalive_time=120
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=4
+net.ipv4.udp_rmem_min=16384
+net.ipv4.udp_wmem_min=16384
 `
 
-// cmdInstall self-installs the running binary + the systemd unit, with no network
-// access required — deploy by copying the binary to the server and running this.
 func cmdInstall(args []string) {
 	if os.Geteuid() != 0 {
 		fail("install must run as root")
 	}
-
 	if err := os.MkdirAll("/etc/hedioum", 0755); err != nil {
 		fail("cannot create /etc/hedioum: %v", err)
 	}
-
 	self, err := os.Executable()
 	if err != nil {
 		fail("cannot locate the running binary: %v", err)
 	}
-
 	if err := copyExecutable(self, installBinPath); err != nil {
 		fail("failed to install binary: %v", err)
 	}
@@ -94,15 +95,13 @@ func cmdInstall(args []string) {
 	enableBBR()
 
 	color.HiWhite("\nNext:")
-	color.HiWhite("  Foreign: hedioum-tunnel setup-foreign [--move-ssh]")
-	color.HiWhite("  Iran:    hedioum-tunnel setup-iran --alias ... --target IP:PORT --socks-port N --token HEX")
+	color.HiWhite("  Foreign: hedioum-tunnel setup-foreign --persona performance")
+	color.HiWhite("  Iran:    hedioum-tunnel setup-iran --alias ... --token <PAIRING_TOKEN> --socks-port N --min 10 --max 32 --bw 80 --jitter 0")
 	color.HiWhite("  Then:    systemctl start hedioum.service")
 }
 
-// enableBBR applies congestion control plus symmetric receive/send ceilings. The
-// name is kept for compatibility with the existing installer flow, but this now
-// also prevents one endpoint's smaller TCP receive window from becoming a hidden
-// one-way throughput cap. Best-effort: unsupported sysctls do not abort install.
+// enableBBR applies congestion control plus symmetric receive/send ceilings.
+// Best-effort: unsupported sysctls do not abort install.
 func enableBBR() {
 	if err := os.WriteFile("/etc/sysctl.d/99-hedioum-bbr.conf", []byte(networkSysctlConfig), 0644); err != nil {
 		return
@@ -118,7 +117,6 @@ func copyExecutable(src, dst string) error {
 		return err
 	}
 	defer in.Close()
-
 	tmp := dst + ".new"
 	out, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0755)
 	if err != nil {

@@ -16,7 +16,7 @@ import (
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/muxcfg"
 )
 
-const dialRaceStagger = 125 * time.Millisecond
+const dialRaceStagger = 20 * time.Millisecond
 
 func hubYamuxConfig() *yamux.Config { return muxcfg.WAN() }
 
@@ -32,9 +32,6 @@ func clientMimicFor(ep config.Endpoint, token string) mimic.ClientMimic {
 	}
 }
 
-// DialEndpoint is the public non-cancellable convenience wrapper used by CLI
-// probes/speedtests. Pool races use DialEndpointContext so losing handshakes can be
-// aborted as soon as another endpoint wins.
 func DialEndpoint(ep config.Endpoint, token string, cfg *yamux.Config) (*yamux.Session, error) {
 	return DialEndpointContext(context.Background(), ep, token, cfg)
 }
@@ -45,10 +42,6 @@ func DialEndpointContext(ctx context.Context, ep config.Endpoint, token string, 
 	if err != nil {
 		return nil, err
 	}
-
-	// Mimic handshakes do not take a context directly. Close the underlying socket
-	// on cancellation so a losing TLS/STARTTLS/SSH race wakes immediately rather
-	// than holding an FD and CPU until its independent handshake deadline expires.
 	stopCancelWatch := make(chan struct{})
 	go func() {
 		select {
@@ -89,9 +82,8 @@ type endpointDialer struct {
 	node    config.ForeignNode
 	cfg     *yamux.Config
 	weights []float64
-
-	mu     sync.Mutex
-	health map[string]*epHealth
+	mu      sync.Mutex
+	health  map[string]*epHealth
 }
 
 type epHealth struct {
@@ -100,7 +92,7 @@ type epHealth struct {
 }
 
 const (
-	dialMaxAttempts = 4
+	dialMaxAttempts = 6
 	epFailThreshold = 2
 	epCooldownBase  = 60 * time.Second
 	epCooldownMax   = 10 * time.Minute
@@ -118,6 +110,19 @@ func dialRank(m string) int {
 		return r
 	}
 	return 3
+}
+
+func performanceEndpointSet(eps []config.Endpoint) bool {
+	if len(eps) == 0 {
+		return false
+	}
+	for _, ep := range eps {
+		switch ep.Mimic {
+		case "ssh", "smtp", "imap", "postgres", "mysql":
+			return false
+		}
+	}
+	return true
 }
 
 func newEndpointDialer(node config.ForeignNode) *endpointDialer {
@@ -153,21 +158,26 @@ func (d *endpointDialer) attemptOrder() []config.Endpoint {
 		return nil
 	}
 
-	primary := d.weightedPick(pool)
-	seen := map[int]bool{primary: true}
-	order := []int{primary}
-
-	rest := append([]int(nil), pool...)
-	sort.SliceStable(rest, func(a, b int) bool {
-		return dialRank(eps[rest[a]].Mimic) < dialRank(eps[rest[b]].Mimic)
-	})
-	for _, i := range rest {
-		if !seen[i] {
-			order = append(order, i)
-			seen[i] = true
+	var order []int
+	if performanceEndpointSet(eps) {
+		order = append(order, pool...)
+		order = append(order, cooling...)
+	} else {
+		primary := d.weightedPick(pool)
+		seen := map[int]bool{primary: true}
+		order = []int{primary}
+		rest := append([]int(nil), pool...)
+		sort.SliceStable(rest, func(a, b int) bool {
+			return dialRank(eps[rest[a]].Mimic) < dialRank(eps[rest[b]].Mimic)
+		})
+		for _, i := range rest {
+			if !seen[i] {
+				order = append(order, i)
+				seen[i] = true
+			}
 		}
+		order = append(order, cooling...)
 	}
-	order = append(order, cooling...)
 	if len(order) > dialMaxAttempts {
 		order = order[:dialMaxAttempts]
 	}
@@ -228,15 +238,11 @@ type dialResult struct {
 	err     error
 }
 
-// dial performs a staggered parallel race. A shared context is cancelled when the
-// first endpoint wins, which aborts in-flight loser TCP/mimic handshakes instead of
-// allowing them to consume descriptors for their full timeout.
 func (d *endpointDialer) dial() (*yamux.Session, string, error) {
 	attempts := d.attemptOrder()
 	if len(attempts) == 0 {
 		return nil, "", fmt.Errorf("node %q has no endpoints to dial", d.node.Alias)
 	}
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	results := make(chan dialResult)
@@ -254,11 +260,8 @@ func (d *endpointDialer) dial() (*yamux.Session, string, error) {
 				case <-t.C:
 				}
 			}
-
 			session, err := DialEndpointContext(ctx, ep, d.node.AuthToken, d.cfg)
 			if err != nil {
-				// Cancellation means another endpoint already won; do not poison this
-				// endpoint's health score for a race it intentionally lost.
 				if ctx.Err() != nil {
 					return
 				}
@@ -269,7 +272,6 @@ func (d *endpointDialer) dial() (*yamux.Session, string, error) {
 				}
 				return
 			}
-
 			d.recordSuccess(ep.Target)
 			select {
 			case results <- dialResult{session: session, mimic: ep.Mimic, target: ep.Target}:
@@ -289,14 +291,12 @@ func (d *endpointDialer) dial() (*yamux.Session, string, error) {
 			lastErr = r.err
 			continue
 		}
-
 		close(done)
 		cancel()
 		slog.Info("pipe established", "node", d.node.Alias, "mimic", r.mimic, "target", r.target)
 		go keepAlive(r.session)
 		return r.session, r.mimic, nil
 	}
-
 	if lastErr == nil {
 		lastErr = fmt.Errorf("node %q: all endpoint attempts failed", d.node.Alias)
 	}

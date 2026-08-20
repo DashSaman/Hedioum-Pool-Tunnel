@@ -5,8 +5,6 @@ import (
 	"testing"
 )
 
-// TestResolveShapeAndCoherence: every persona resolves to ssh + exactly 9, includes
-// its core (with tls), is coherent, and has no duplicates.
 func TestResolveShapeAndCoherence(t *testing.T) {
 	for _, name := range Names() {
 		set, err := Resolve(name, "seed-"+name)
@@ -14,10 +12,7 @@ func TestResolveShapeAndCoherence(t *testing.T) {
 			t.Fatalf("%s: %v", name, err)
 		}
 		if len(set) != 10 {
-			t.Fatalf("%s: got %d mimics, want 10 (ssh + 9): %v", name, len(set), set)
-		}
-		if set[0] != "ssh" {
-			t.Fatalf("%s: backbone must be first, got %q", name, set[0])
+			t.Fatalf("%s: got %d mimics, want 10: %v", name, len(set), set)
 		}
 		seen := map[string]bool{}
 		for _, m := range set {
@@ -27,7 +22,7 @@ func TestResolveShapeAndCoherence(t *testing.T) {
 			seen[m] = true
 		}
 		if !seen["tls"] {
-			t.Fatalf("%s: every persona must include tls (:443) for bootstrap: %v", name, set)
+			t.Fatalf("%s: every persona must include tls (:443): %v", name, set)
 		}
 		for _, c := range Registry[name].Core {
 			if !seen[c] {
@@ -37,10 +32,32 @@ func TestResolveShapeAndCoherence(t *testing.T) {
 		if err := CheckCoherence(set); err != nil {
 			t.Fatalf("%s: resolved set is incoherent: %v", name, err)
 		}
+		if Registry[name].Backbone != "" && set[0] != Registry[name].Backbone {
+			t.Fatalf("%s: backbone must be first, got %q", name, set[0])
+		}
 	}
 }
 
-// TestDeterministic: same (persona, seed) → identical set; the order is stable.
+func TestPerformancePersonaIsSSHFreeAndImplicitTLSOnly(t *testing.T) {
+	set, err := Resolve("performance", "seed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := map[string]bool{
+		"tls": true, "https-alt": true, "smtps": true, "imaps": true,
+		"docker": true, "grafana": true, "prometheus": true,
+		"cpanel": true, "whm": true, "webmail": true,
+	}
+	for _, m := range set {
+		if m == "ssh" {
+			t.Fatal("performance persona must never include ssh")
+		}
+		if !allowed[m] {
+			t.Fatalf("performance persona contains non implicit-TLS mimic %q", m)
+		}
+	}
+}
+
 func TestDeterministic(t *testing.T) {
 	a, _ := Resolve("cpanel", "token-A")
 	b, _ := Resolve("cpanel", "token-A")
@@ -49,8 +66,6 @@ func TestDeterministic(t *testing.T) {
 	}
 }
 
-// TestSeedVariation: two different seeds of the same persona differ in their fill
-// (the pool is larger than the slack), so same-persona installs are not identical.
 func TestSeedVariation(t *testing.T) {
 	seen := map[string]int{}
 	for _, s := range []string{"a", "b", "c", "d", "e", "f", "g", "h"} {
@@ -62,34 +77,23 @@ func TestSeedVariation(t *testing.T) {
 	}
 }
 
-// TestAutoSpreads: Auto distributes across all three personas over many seeds and is
-// deterministic per seed.
-func TestAutoSpreads(t *testing.T) {
-	if Auto("x") != Auto("x") {
-		t.Fatal("Auto must be deterministic per seed")
-	}
-	got := map[string]bool{}
-	for i := 0; i < 200; i++ {
-		got[Auto(string(rune('a'+i%26))+string(rune('0'+i/26)))] = true
-	}
-	for _, name := range Names() {
-		if !got[name] {
-			t.Fatalf("Auto never selected persona %q over 200 seeds", name)
+func TestAutoIsPerformanceAndDeterministic(t *testing.T) {
+	for _, seed := range []string{"a", "b", "different-token", "x"} {
+		if got := Auto(seed); got != "performance" {
+			t.Fatalf("Auto(%q)=%q, want performance", seed, got)
 		}
 	}
 }
 
-// TestCoherenceValidator: the validator flags cPanel-family + DirectAdmin together.
 func TestCoherenceValidator(t *testing.T) {
 	if err := CheckCoherence([]string{"ssh", "tls", "cpanel", "directadmin"}); err == nil {
 		t.Fatal("cpanel + directadmin should be rejected as incoherent")
 	}
-	if err := CheckCoherence([]string{"ssh", "tls", "whm", "postgres"}); err != nil {
-		t.Fatalf("coherent cPanel set wrongly rejected: %v", err)
+	if err := CheckCoherence([]string{"tls", "whm", "docker"}); err != nil {
+		t.Fatalf("coherent performance/cPanel set wrongly rejected: %v", err)
 	}
 }
 
-// TestUnknownPersona: Resolve errors on an unknown name.
 func TestUnknownPersona(t *testing.T) {
 	if _, err := Resolve("nope", "s"); err == nil {
 		t.Fatal("unknown persona should error")

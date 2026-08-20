@@ -5,22 +5,27 @@ import (
 	"time"
 )
 
-// TestPolicyRollBounds verifies the rolled lifetimes/budgets always land inside the
-// documented global bounds, across many draws, for both SSH and non-SSH mimics.
 func TestPolicyRollBounds(t *testing.T) {
 	p := NewLifecyclePolicy("some-node-auth-token")
-
 	for i := 0; i < 5000; i++ {
-		// Non-SSH: bounded lifetime AND a real transfer budget.
-		life, budget := p.roll("tls")
-		if life < auxMinLifetime || life > auxMaxLifetime {
-			t.Fatalf("aux lifetime %v out of [%v,%v]", life, auxMinLifetime, auxMaxLifetime)
+		// Implicit TLS: long lifetime and NO byte budget.
+		tlsLife, tlsBudget := p.roll("tls")
+		if tlsLife < tlsMinLifetime || tlsLife > tlsMaxLifetime {
+			t.Fatalf("tls lifetime %v out of [%v,%v]", tlsLife, tlsMinLifetime, tlsMaxLifetime)
 		}
-		if budget < auxMinBudget || budget > auxMaxBudget {
-			t.Fatalf("aux budget %d out of [%d,%d]", budget, uint64(auxMinBudget), uint64(auxMaxBudget))
+		if tlsBudget != 0 {
+			t.Fatalf("stable TLS must have no byte budget, got %d", tlsBudget)
 		}
 
-		// SSH: long lifetime, and NO byte budget (backbone tolerates volume).
+		// STARTTLS/legacy auxiliary: short lifetime plus byte budget.
+		auxLife, auxBudget := p.roll("smtp")
+		if auxLife < auxMinLifetime || auxLife > auxMaxLifetime {
+			t.Fatalf("aux lifetime %v out of [%v,%v]", auxLife, auxMinLifetime, auxMaxLifetime)
+		}
+		if auxBudget < auxMinBudget || auxBudget > auxMaxBudget {
+			t.Fatalf("aux budget %d out of [%d,%d]", auxBudget, uint64(auxMinBudget), uint64(auxMaxBudget))
+		}
+
 		sshLife, sshBudget := p.roll("ssh")
 		if sshLife < sshMinLifetime || sshLife > sshMaxLifetime {
 			t.Fatalf("ssh lifetime %v out of [%v,%v]", sshLife, sshMinLifetime, sshMaxLifetime)
@@ -31,29 +36,35 @@ func TestPolicyRollBounds(t *testing.T) {
 	}
 }
 
-// TestPolicyPerServerPersonality verifies two servers (different auth tokens) land
-// on different baselines — distinct aggregate "handwriting" — while one token is
-// deterministic (stable personality for that server).
+func TestStableTLSMimics(t *testing.T) {
+	stable := []string{"tls", "smtps", "imaps", "https-alt", "directadmin", "docker", "grafana", "prometheus", "cpanel", "whm", "webmail"}
+	for _, m := range stable {
+		if !isStableTLSMimic(m) {
+			t.Fatalf("%s should use stable TLS lifecycle", m)
+		}
+	}
+	for _, m := range []string{"ssh", "smtp", "imap", "postgres", "mysql"} {
+		if isStableTLSMimic(m) {
+			t.Fatalf("%s must not be classified as implicit stable TLS", m)
+		}
+	}
+}
+
 func TestPolicyPerServerPersonality(t *testing.T) {
 	a := NewLifecyclePolicy("token-server-A")
 	b := NewLifecyclePolicy("token-server-B")
-
 	if a.auxLifetimeBase == b.auxLifetimeBase &&
 		a.auxBudgetBase == b.auxBudgetBase &&
+		a.tlsLifetimeBase == b.tlsLifetimeBase &&
 		a.sshLifetimeBase == b.sshLifetimeBase {
 		t.Fatal("two different tokens produced identical personalities")
 	}
-
-	// Same token -> same personality (stable per server).
 	a2 := NewLifecyclePolicy("token-server-A")
 	if a != a2 {
 		t.Fatalf("same token produced different personalities: %+v vs %+v", a, a2)
 	}
 }
 
-// TestPolicyPerConnectionJitter verifies that, within one server, repeated rolls do
-// NOT collapse to a single value — every connection differs (no fixed per-pipe
-// signature).
 func TestPolicyPerConnectionJitter(t *testing.T) {
 	p := NewLifecyclePolicy("jitter-token")
 	seen := map[time.Duration]int{}
@@ -62,89 +73,79 @@ func TestPolicyPerConnectionJitter(t *testing.T) {
 		seen[life]++
 	}
 	if len(seen) < 50 {
-		t.Fatalf("aux lifetimes not varied enough: only %d distinct values", len(seen))
+		t.Fatalf("tls lifetimes not varied enough: only %d distinct values", len(seen))
 	}
 }
 
-// TestShouldRetireByAge: a non-SSH pipe past its lifetime retires; a fresh one does not.
 func TestShouldRetireByAge(t *testing.T) {
-	fresh := &YamuxSession{mimicType: "tls", bornAt: time.Now(), retireAfter: time.Hour, byteBudget: 5 * gib}
+	fresh := &YamuxSession{mimicType: "tls", bornAt: time.Now(), retireAfter: 4 * time.Hour, byteBudget: 0}
 	if fresh.ShouldRetire() {
-		t.Fatal("a fresh pipe within budget must not retire")
+		t.Fatal("a fresh pipe must not retire")
 	}
-	old := &YamuxSession{mimicType: "tls", bornAt: time.Now().Add(-2 * time.Hour), retireAfter: time.Hour, byteBudget: 5 * gib}
+	old := &YamuxSession{mimicType: "tls", bornAt: time.Now().Add(-5 * time.Hour), retireAfter: 4 * time.Hour, byteBudget: 0}
 	if !old.ShouldRetire() {
 		t.Fatal("a pipe past its lifetime must retire")
 	}
 }
 
-// TestShouldRetireByBytes: a non-SSH pipe over its transfer budget retires even if young.
-func TestShouldRetireByBytes(t *testing.T) {
-	s := &YamuxSession{mimicType: "tls", bornAt: time.Now(), retireAfter: time.Hour, byteBudget: 1 * gib}
-	s.cumulativeBytes = 2 * gib
-	if !s.ShouldRetire() {
-		t.Fatal("a pipe over its byte budget must retire")
+func TestStableTLSNeverRetiresByBytes(t *testing.T) {
+	s := &YamuxSession{mimicType: "tls", bornAt: time.Now(), retireAfter: 8 * time.Hour, byteBudget: 0}
+	s.cumulativeBytes = 500 * gib
+	if s.ShouldRetire() {
+		t.Fatal("stable TLS must not retire on transfer volume")
 	}
 }
 
-// TestShouldRetireSSHNoByteBudget: SSH (byteBudget 0) never retires on volume, only
-// on its long lifetime.
+func TestAuxCanRetireByBytes(t *testing.T) {
+	s := &YamuxSession{mimicType: "smtp", bornAt: time.Now(), retireAfter: time.Hour, byteBudget: 1 * gib}
+	s.cumulativeBytes = 2 * gib
+	if !s.ShouldRetire() {
+		t.Fatal("auxiliary STARTTLS pipe over byte budget must retire")
+	}
+}
+
 func TestShouldRetireSSHNoByteBudget(t *testing.T) {
 	s := &YamuxSession{mimicType: "ssh", bornAt: time.Now(), retireAfter: 12 * time.Hour, byteBudget: 0}
-	s.cumulativeBytes = 500 * gib // huge volume
+	s.cumulativeBytes = 500 * gib
 	if s.ShouldRetire() {
-		t.Fatal("SSH must not retire on volume (no byte budget)")
+		t.Fatal("SSH must not retire on volume")
 	}
-
 	oldSSH := &YamuxSession{mimicType: "ssh", bornAt: time.Now().Add(-13 * time.Hour), retireAfter: 12 * time.Hour}
 	if !oldSSH.ShouldRetire() {
 		t.Fatal("SSH must still retire once past its long lifetime")
 	}
 }
 
-// TestEvaluateHealthRetiresExpiredPipe drives the real watchdog once over a live
-// yamux session forced past its lifetime and asserts it is shifted to Draining
-// (the pool then closes it and churns to a fresh pipe on later passes).
 func TestEvaluateHealthRetiresExpiredPipe(t *testing.T) {
 	sess, _, err := fakeDialer()
 	if err != nil {
 		t.Fatalf("fakeDialer: %v", err)
 	}
 	ys := NewYamuxSession(sess, 10, 2, "tls", NewLifecyclePolicy("tok"))
-	ys.bornAt = time.Now().Add(-2 * time.Hour) // force past a 1h lifetime
-	ys.retireAfter = time.Hour
-
+	ys.bornAt = time.Now().Add(-5 * time.Hour)
+	ys.retireAfter = 4 * time.Hour
 	np := &NodePool{
-		Alias:          "n",
-		label:          "tcp",
-		minConnections: 0, // no replenish -> the nil dialer is never called
-		maxConnections: 5,
-		sessions:       []*YamuxSession{ys},
-		shutdown:       make(chan struct{}),
+		Alias: "n", label: "tcp", minConnections: 0, maxConnections: 5,
+		sessions: []*YamuxSession{ys}, shutdown: make(chan struct{}),
 	}
 	np.evaluateHealthAndScale()
-
 	if !ys.IsDraining() {
-		t.Fatal("an expired pipe must be shifted to Draining by the watchdog")
+		t.Fatal("an expired pipe must shift to Draining")
 	}
 }
 
-// TestNewYamuxSessionRollsBudget checks the constructor wires the policy through:
-// a non-SSH session gets a bounded lifetime + budget; an SSH one gets no budget.
-func TestNewYamuxSessionRollsBudget(t *testing.T) {
+func TestNewYamuxSessionRollsStableTLSPolicy(t *testing.T) {
 	p := NewLifecyclePolicy("ctor-token")
-
 	tls := NewYamuxSession(nil, 10, 2, "tls", p)
-	if tls.retireAfter < auxMinLifetime || tls.retireAfter > auxMaxLifetime {
-		t.Fatalf("tls retireAfter %v out of aux bounds", tls.retireAfter)
+	if tls.retireAfter < tlsMinLifetime || tls.retireAfter > tlsMaxLifetime {
+		t.Fatalf("tls retireAfter %v out of stable TLS bounds", tls.retireAfter)
 	}
-	if tls.byteBudget == 0 {
-		t.Fatal("tls session must have a transfer budget")
+	if tls.byteBudget != 0 {
+		t.Fatal("stable TLS session must have no transfer budget")
 	}
 	if tls.bornAt.IsZero() {
 		t.Fatal("bornAt must be set")
 	}
-
 	ssh := NewYamuxSession(nil, 10, 2, "ssh", p)
 	if ssh.byteBudget != 0 {
 		t.Fatal("ssh session must have no transfer budget")

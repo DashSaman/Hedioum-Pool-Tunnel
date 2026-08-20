@@ -1,6 +1,7 @@
 [Unit]
 Description=Hedioum Dynamic Pool Tunnel Daemon
-After=network.target ssh.service sshd.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 Type=simple
@@ -13,8 +14,9 @@ ExecStartPre=+/usr/local/bin/hedioum-tunnel --network-tune
 ExecStartPre=+/usr/local/bin/hedioum-tunnel --open-firewall
 ExecStart=/usr/local/bin/hedioum-tunnel
 Restart=always
-RestartSec=5
+RestartSec=3
 LimitNOFILE=1048576
+TimeoutStopSec=30
 
 # --- Sandbox hardening ---
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE{{if .TunCapable}} CAP_NET_ADMIN{{end}}

@@ -112,9 +112,6 @@ func dialRank(m string) int {
 	return 3
 }
 
-// performanceEndpointSet identifies the SSH-free, single-layer-TLS shape. In
-// this mode endpoint order is an explicit performance preference (written by the
-// optimize command), so the dialer honors it instead of randomizing the primary.
 func performanceEndpointSet(eps []config.Endpoint) bool {
 	if len(eps) == 0 {
 		return false
@@ -163,8 +160,6 @@ func (d *endpointDialer) attemptOrder() []config.Endpoint {
 
 	var order []int
 	if performanceEndpointSet(eps) {
-		// Config order was benchmarked receiver-to-receiver. Healthy entries keep
-		// that order; cooling entries move to the end as emergency fallbacks.
 		order = append(order, pool...)
 		order = append(order, cooling...)
 	} else {
@@ -180,6 +175,7 @@ func (d *endpointDialer) attemptOrder() []config.Endpoint {
 				order = append(order, i)
 				seen[i] = true
 			}
+		}
 		order = append(order, cooling...)
 	}
 	if len(order) > dialMaxAttempts {

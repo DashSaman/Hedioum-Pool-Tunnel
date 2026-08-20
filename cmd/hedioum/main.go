@@ -20,12 +20,12 @@ import (
 // AppVersion defines the current build version for the self-updater.
 // It matches the fork release tag produced by .github/workflows/fork-release.yml.
 //
-// v0.11.2-pv1 is the deep data-plane hardening release: receiver-verified
-// directional speed tests, symmetric high-BDP host tuning, safer WAN timeouts,
-// make-before-break lifecycle churn, reservation-aware pipe balancing, bounded
-// recovery/UDP/DNS resources and reduced high-rate GC pressure. Wire framing for
-// normal TCP/UDP user traffic remains compatible with the previous fork release.
-const AppVersion = "v0.11.2-pv1"
+// v0.11.3-pv1 is the performance-first production release: the default persona is
+// SSH-free and single-layer TLS, OpenSSH mutation is hard-disabled, Yamux uses a
+// symmetric 32 MiB stream window, host TCP autotuning ceilings are 64 MiB, stable
+// TLS pipes rotate only on multi-hour age (never byte volume), and the endpoint
+// optimizer ranks real receiver-measured download/upload symmetry before runtime.
+const AppVersion = "v0.11.3-pv1"
 
 func main() {
 	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
@@ -162,16 +162,16 @@ func isTerminal(f *os.File) bool {
 
 func printSetupHint() {
 	color.HiWhite("\nConfigure non-interactively, then start the service:")
-	color.HiWhite("  Foreign: hedioum-tunnel setup-foreign            (auto-picks a persona; prints a pairing token)")
+	color.HiWhite("  Foreign: hedioum-tunnel setup-foreign --persona performance")
 	color.HiWhite("  Iran:    hedioum-tunnel setup-iran --alias NAME --token <PAIRING_TOKEN> --socks-port N")
+	color.HiWhite("  Tune:    hedioum-tunnel optimize --node NAME --seconds 3 --apply=true")
 	color.HiWhite("  Then:    systemctl start hedioum.service")
-	color.HiBlack("  (The pairing token carries the IP, ports and persona — no --target-ip/--mimics needed.)")
-	color.HiBlack("  (Or run 'hedioum-tunnel' on an interactive terminal for the guided wizard.)")
+	color.HiBlack("  (The performance persona never requires or modifies OpenSSH.)")
 }
 
 func printHeader() {
 	color.Cyan("=========================================================")
 	color.HiCyan("   Hedioum Dynamic Pool Tunnel - Management Dashboard")
-	color.HiWhite("   Version: %s | Core: Chaos Mesh Routing", AppVersion)
+	color.HiWhite("   Version: %s | Core: Performance Pool Routing", AppVersion)
 	color.Cyan("=========================================================\n")
 }

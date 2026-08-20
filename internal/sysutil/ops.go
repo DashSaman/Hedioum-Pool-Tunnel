@@ -33,7 +33,6 @@ type GitHubRelease struct {
 
 func SelfUpdate(currentVersion string) {
 	color.Cyan("[*] Checking for updates...")
-
 	release, err := fetchLatestRelease()
 	if err != nil {
 		color.Red("[x] Failed to query GitHub: %v", err)
@@ -44,14 +43,12 @@ func SelfUpdate(currentVersion string) {
 		color.Green("[✓] You are already running the latest version (%s).", currentVersion)
 		return
 	}
-
 	asset := targetAsset()
 	url := assetURL(release, asset)
 	if url == "" {
 		color.Red("[x] Release %s has no '%s' binary.", release.TagName, asset)
 		return
 	}
-
 	color.Yellow("[*] New version %s found. Downloading (%d attempts)...", release.TagName, downloadAttempts)
 	defer os.Remove(stagePath)
 	if err := downloadWithRetry(url, stagePath, downloadAttempts); err != nil {
@@ -127,18 +124,15 @@ func manualHint() {
 	color.HiWhite("      hedioum-tunnel update --file /path/to/%s", targetAsset())
 }
 
-// installStaged swaps stagePath into place with backup + restart + health-check +
-// rollback. Before the new daemon starts, invoke the NEW binary's privileged
-// network-tune mode. That makes self-update apply the release's current symmetric
-// BBR/buffer policy too; otherwise an old host could keep stale one-way window
-// ceilings indefinitely even after its binary was upgraded.
+// installStaged swaps the new binary into place with backup + restart + health
+// check + rollback. The NEW binary's network policy is applied before restart so
+// both endpoints always converge to the same BBR/high-BDP settings after update.
 func installStaged(label string) {
 	if st, err := os.Stat(stagePath); err != nil || st.Size() < minBinarySize {
 		color.Red("[x] Staged binary missing or too small; aborting update.")
 		return
 	}
 	_ = os.Chmod(stagePath, 0755)
-
 	color.Cyan("[*] Backing up the current binary...")
 	if err := os.Rename(binaryPath, backupPath); err != nil {
 		color.Red("[x] Failed to create backup: %v", err)
@@ -150,13 +144,9 @@ func installStaged(label string) {
 		return
 	}
 	_ = os.Chmod(binaryPath, 0755)
-
-	// Best effort because kernels/containers may intentionally disallow some
-	// sysctls. The daemon itself is still valid if tuning is unavailable.
 	if err := exec.Command(binaryPath, "--network-tune").Run(); err != nil {
 		color.Yellow("[-] Network tuning could not be fully applied; continuing update.")
 	}
-
 	color.Cyan("[*] Restarting daemon...")
 	_ = exec.Command("systemctl", "restart", "hedioum.service").Run()
 	time.Sleep(2 * time.Second)
@@ -165,7 +155,6 @@ func installStaged(label string) {
 		rollback()
 		return
 	}
-
 	_ = os.Remove(backupPath)
 	color.Green("\n[✓] Update successful (%s).", label)
 }
@@ -205,22 +194,14 @@ func Uninstall() {
 	color.Yellow("[*] Stopping and disabling Hedioum service...")
 	_ = exec.Command("systemctl", "stop", "hedioum.service").Run()
 	_ = exec.Command("systemctl", "disable", "hedioum.service").Run()
-
 	color.Yellow("[*] Removing Systemd service file...")
 	_ = os.Remove("/etc/systemd/system/hedioum.service")
 	_ = exec.Command("systemctl", "daemon-reload").Run()
-
 	color.Yellow("[*] Removing binaries and configuration files...")
 	_ = os.RemoveAll("/etc/hedioum")
 	_ = os.Remove(binaryPath)
 	_ = os.Remove(backupPath)
-
-	if isUFWActive() {
-		color.Yellow("[*] Removing UFW firewall rule for port 2022...")
-		_ = exec.Command("ufw", "delete", "allow", "2022/tcp").Run()
-	}
-
-	color.Green("[✓] Hedioum has been completely removed from this system.")
-	color.HiRed("IMPORTANT: Remember to manually change your SSH port back to 22 in '/etc/ssh/sshd_config' if you moved it during installation!")
+	_ = os.Remove(stagePath)
+	color.Green("[✓] Hedioum has been completely removed. OpenSSH configuration was never modified.")
 	os.Exit(0)
 }

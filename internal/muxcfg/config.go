@@ -10,18 +10,20 @@ import (
 )
 
 const (
-	StreamWindow = 16 << 20 // 16 MiB: high-RTT bandwidth-delay-product headroom
-	AcceptBacklog = 1024
+	// 32 MiB covers roughly 400 Mbps at ~670 ms BDP. The previous 16 MiB window
+	// could cap a single logical flow on long-RTT Iran↔foreign paths even when the
+	// NIC and outer TCP still had spare capacity. We stop at 32 MiB rather than
+	// using extreme 64/128 MiB values, keeping per-stream memory pressure bounded.
+	StreamWindow = 32 << 20
+	AcceptBacklog = 2048
+
 	// A stream open is normally one control RTT, but Iran↔foreign paths can briefly
-	// pause for several seconds under loss/retransmission. Five seconds was too
-	// aggressive because Yamux closes the WHOLE physical session when this timeout
-	// fires. Ten seconds still detects a wedged pipe quickly without converting a
-	// transient WAN stall into a mass user disconnect.
+	// pause for several seconds under loss/retransmission. Ten seconds detects a
+	// wedged pipe without converting a transient WAN stall into a mass disconnect.
 	OpenTimeout = 10 * time.Second
-	// Yamux uses this value both for queued writes and Ping replies. Ten seconds can
-	// be reached during a transient congestion/loss episode even while TCP is still
-	// recovering. Give the kernel retransmission machinery room to recover before
-	// declaring the shared physical pipe dead and dropping all logical streams.
+
+	// Yamux uses this for queued writes and Ping replies. Give TCP retransmission
+	// room to recover before declaring the shared physical pipe dead.
 	WriteTimeout = 30 * time.Second
 	CloseTimeout = 5 * time.Minute
 )

@@ -1,10 +1,4 @@
-// Package persona groups the mimic library into coherent server identities. Instead
-// of a random grab-bag of camouflage listeners, each install wears one persona — the
-// SSH backbone plus a fixed set of non-SSH mimics that together look like one real,
-// ordinary server (a cPanel host, a DirectAdmin host, or a DevOps/app host). This
-// keeps the on-wire footprint internally consistent (a host never runs both cPanel
-// and DirectAdmin, for example), while a per-install seed still makes two installs of
-// the same persona differ in their optional ports.
+// Package persona groups the mimic library into coherent server identities.
 package persona
 
 import (
@@ -14,76 +8,93 @@ import (
 	"sort"
 )
 
-// backbone is the long-lived mimic every persona is built on. Every server has SSH,
-// so it is universally consistent; it is always added first.
-const backbone = "ssh"
-
-// A Persona is a coherent identity. Core mimics define it and are always present;
-// the rest are filled deterministically from Pool (in seeded order) up to Size.
+// A Persona is a coherent identity. Backbone is optional. Legacy personas keep
+// SSH as a backbone, while the performance persona intentionally has no SSH
+// dependency at all. Core mimics define the identity and are always present; Pool
+// is deterministically filled until Size non-backbone mimics are selected.
 type Persona struct {
-	Name string
-	Core []string // always included (besides ssh); defines the identity
-	Pool []string // seeded fill, drawn until Size is reached
-	Size int      // number of non-ssh mimics (ssh is always added on top)
+	Name     string
+	Backbone string
+	Core     []string
+	Pool     []string
+	Size     int
 }
 
-// Registry holds the coherent personas. Every persona's Core includes "tls" (:443),
-// guaranteeing an always-reachable bootstrap path. "cpanel" and "directadmin" are
-// mutually exclusive by construction (the panel-family coherence rule).
+// Performance is the production-oriented default for the DashSaman fork. It uses
+// only implicit-TLS transports, so OpenSSH is never touched and the hot path uses
+// a single TLS crypto layer rather than the SSH-mimic securestream framing path.
+// The set deliberately keeps multiple conventional TLS ports for failover/racing.
 var Registry = map[string]Persona{
+	"performance": {
+		Name:     "performance",
+		Backbone: "",
+		Core: []string{
+			"tls", "https-alt", "smtps", "imaps", "docker",
+			"grafana", "prometheus", "cpanel", "whm", "webmail",
+		},
+		Size: 10,
+	},
 	"cpanel": {
-		Name: "cpanel",
-		Core: []string{"tls", "cpanel", "whm", "webmail"},
-		Pool: []string{"https-alt", "smtp", "smtps", "imaps", "imap", "postgres", "mysql", "docker"},
-		Size: 9,
+		Name:     "cpanel",
+		Backbone: "ssh",
+		Core:     []string{"tls", "cpanel", "whm", "webmail"},
+		Pool:     []string{"https-alt", "smtp", "smtps", "imaps", "imap", "postgres", "mysql", "docker"},
+		Size:     9,
 	},
 	"directadmin": {
-		Name: "directadmin",
-		Core: []string{"tls", "directadmin"},
-		Pool: []string{"https-alt", "smtp", "smtps", "imaps", "imap", "postgres", "mysql", "docker", "grafana"},
-		Size: 9,
+		Name:     "directadmin",
+		Backbone: "ssh",
+		Core:     []string{"tls", "directadmin"},
+		Pool:     []string{"https-alt", "smtp", "smtps", "imaps", "imap", "postgres", "mysql", "docker", "grafana"},
+		Size:     9,
 	},
 	"devops": {
-		Name: "devops",
-		Core: []string{"tls", "https-alt", "docker", "grafana", "prometheus"},
-		Pool: []string{"postgres", "mysql", "smtp", "smtps", "imap", "imaps"},
-		Size: 9,
+		Name:     "devops",
+		Backbone: "ssh",
+		Core:     []string{"tls", "https-alt", "docker", "grafana", "prometheus"},
+		Pool:     []string{"postgres", "mysql", "smtp", "smtps", "imap", "imaps"},
+		Size:     9,
 	},
 }
 
-// order is the stable persona order for listing and deterministic Auto selection.
-var order = []string{"cpanel", "directadmin", "devops"}
+var order = []string{"performance", "cpanel", "directadmin", "devops"}
 
-// Names lists the persona names in a stable order.
 func Names() []string {
 	out := make([]string, len(order))
 	copy(out, order)
 	return out
 }
 
-// Known reports whether name is a defined persona.
 func Known(name string) bool {
 	_, ok := Registry[name]
 	return ok
 }
 
-// Auto deterministically selects a persona from the seed (the node's secret token),
-// so a server always wears the same persona and the population spreads across all three.
+// Auto intentionally selects the SSH-free performance persona in this fork.
+// Operators who explicitly want a legacy camouflage persona can still select it
+// by name, but an unattended/default setup can never require moving OpenSSH.
 func Auto(seed string) string {
-	h := sha256.Sum256([]byte("hedioum-persona\x00" + seed))
-	return order[int(h[0])%len(order)]
+	_ = seed
+	return "performance"
 }
 
-// Resolve returns the ordered mimic-type set for a persona: the SSH backbone first,
-// then Core (in definition order), then a deterministic seeded fill from Pool up to
-// Size. The result always has Size+1 entries (ssh + Size) and is coherent.
+// Resolve returns the ordered mimic set. The optional backbone is first, followed
+// by Core and deterministic Pool fill. Size counts non-backbone mimics so legacy
+// personas remain shape-compatible (ssh + 9), while performance resolves to ten
+// TLS-family mimics and no SSH endpoint.
 func Resolve(name, seed string) ([]string, error) {
 	p, ok := Registry[name]
 	if !ok {
 		return nil, fmt.Errorf("unknown persona %q (want one of %v)", name, order)
 	}
-	set := []string{backbone}
-	seen := map[string]bool{backbone: true}
+	set := make([]string, 0, p.Size+1)
+	seen := make(map[string]bool, p.Size+1)
+	backboneCount := 0
+	if p.Backbone != "" {
+		set = append(set, p.Backbone)
+		seen[p.Backbone] = true
+		backboneCount = 1
+	}
 	for _, m := range p.Core {
 		if !seen[m] {
 			set = append(set, m)
@@ -91,7 +102,7 @@ func Resolve(name, seed string) ([]string, error) {
 		}
 	}
 	for _, m := range seededOrder(p.Pool, seed) {
-		if len(set)-1 >= p.Size {
+		if len(set)-backboneCount >= p.Size {
 			break
 		}
 		if !seen[m] {
@@ -99,14 +110,14 @@ func Resolve(name, seed string) ([]string, error) {
 			seen[m] = true
 		}
 	}
-	if len(set)-1 != p.Size {
+	if len(set)-backboneCount != p.Size {
 		return nil, fmt.Errorf("persona %q: pool too small to reach size %d", name, p.Size)
 	}
 	return set, nil
 }
 
 // CheckCoherence rejects an incoherent mimic set. A real server never runs both
-// cPanel (cpanel/whm/webmail) and DirectAdmin, so they must not share one host.
+// cPanel-family and DirectAdmin identities on the same host.
 func CheckCoherence(mimics []string) error {
 	has := make(map[string]bool, len(mimics))
 	for _, m := range mimics {
@@ -118,9 +129,6 @@ func CheckCoherence(mimics []string) error {
 	return nil
 }
 
-// seededOrder returns items in a deterministic per-seed order: each item gets a
-// hash-derived key from (seed, item), and the items are sorted by that key. Same seed
-// → same order; different seeds → different fills, so same-persona installs vary.
 func seededOrder(items []string, seed string) []string {
 	type kv struct {
 		k uint64

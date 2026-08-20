@@ -16,10 +16,6 @@ import (
 	"github.com/hedioum/Hedioum-Pool-Tunnel/internal/muxcfg"
 )
 
-// Performance persona endpoints are all single-layer TLS transports. Starting
-// backups only 20 ms apart lets a throttled/filtered port lose to a genuinely
-// faster one without adding hundreds of milliseconds to pipe recovery. Losers are
-// context-cancelled immediately after a winner is established.
 const dialRaceStagger = 20 * time.Millisecond
 
 func hubYamuxConfig() *yamux.Config { return muxcfg.WAN() }
@@ -116,6 +112,22 @@ func dialRank(m string) int {
 	return 3
 }
 
+// performanceEndpointSet identifies the SSH-free, single-layer-TLS shape. In
+// this mode endpoint order is an explicit performance preference (written by the
+// optimize command), so the dialer honors it instead of randomizing the primary.
+func performanceEndpointSet(eps []config.Endpoint) bool {
+	if len(eps) == 0 {
+		return false
+	}
+	for _, ep := range eps {
+		switch ep.Mimic {
+		case "ssh", "smtp", "imap", "postgres", "mysql":
+			return false
+		}
+	}
+	return true
+}
+
 func newEndpointDialer(node config.ForeignNode) *endpointDialer {
 	w := make([]float64, len(node.Endpoints))
 	for i := range w {
@@ -149,20 +161,27 @@ func (d *endpointDialer) attemptOrder() []config.Endpoint {
 		return nil
 	}
 
-	primary := d.weightedPick(pool)
-	seen := map[int]bool{primary: true}
-	order := []int{primary}
-	rest := append([]int(nil), pool...)
-	sort.SliceStable(rest, func(a, b int) bool {
-		return dialRank(eps[rest[a]].Mimic) < dialRank(eps[rest[b]].Mimic)
-	})
-	for _, i := range rest {
-		if !seen[i] {
-			order = append(order, i)
-			seen[i] = true
-		}
+	var order []int
+	if performanceEndpointSet(eps) {
+		// Config order was benchmarked receiver-to-receiver. Healthy entries keep
+		// that order; cooling entries move to the end as emergency fallbacks.
+		order = append(order, pool...)
+		order = append(order, cooling...)
+	} else {
+		primary := d.weightedPick(pool)
+		seen := map[int]bool{primary: true}
+		order = []int{primary}
+		rest := append([]int(nil), pool...)
+		sort.SliceStable(rest, func(a, b int) bool {
+			return dialRank(eps[rest[a]].Mimic) < dialRank(eps[rest[b]].Mimic)
+		})
+		for _, i := range rest {
+			if !seen[i] {
+				order = append(order, i)
+				seen[i] = true
+			}
+		order = append(order, cooling...)
 	}
-	order = append(order, cooling...)
 	if len(order) > dialMaxAttempts {
 		order = order[:dialMaxAttempts]
 	}
